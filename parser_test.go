@@ -7,33 +7,37 @@ import (
 
 func TestParseInsert(t *testing.T) {
 	cases := []struct {
-		name      string
-		query     string
-		wantTable string
-		wantCols  []string
-		wantN     int
-		wantErr   bool
+		name       string
+		query      string
+		wantTable  string
+		wantCols   []string
+		wantN      int
+		wantUpsert upsertMode
+		wantErr    bool
 	}{
 		{
-			name:      "basic",
-			query:     "INSERT INTO People (PartitionKey, RowKey, Name, Age) VALUES (?, ?, ?, ?)",
-			wantTable: "People",
-			wantCols:  []string{"PartitionKey", "RowKey", "Name", "Age"},
-			wantN:     4,
+			name:       "basic",
+			query:      "INSERT INTO People (PartitionKey, RowKey, Name, Age) VALUES (?, ?, ?, ?)",
+			wantTable:  "People",
+			wantCols:   []string{"PartitionKey", "RowKey", "Name", "Age"},
+			wantN:      4,
+			wantUpsert: upsertNone,
 		},
 		{
-			name:      "trailing semicolon",
-			query:     "INSERT INTO T (A, B) VALUES (?, ?);",
-			wantTable: "T",
-			wantCols:  []string{"A", "B"},
-			wantN:     2,
+			name:       "trailing semicolon",
+			query:      "INSERT INTO T (A, B) VALUES (?, ?);",
+			wantTable:  "T",
+			wantCols:   []string{"A", "B"},
+			wantN:      2,
+			wantUpsert: upsertNone,
 		},
 		{
-			name:      "lowercase keywords",
-			query:     "insert into t (a, b) values (?, ?)",
-			wantTable: "t",
-			wantCols:  []string{"a", "b"},
-			wantN:     2,
+			name:       "lowercase keywords",
+			query:      "insert into t (a, b) values (?, ?)",
+			wantTable:  "t",
+			wantCols:   []string{"a", "b"},
+			wantN:      2,
+			wantUpsert: upsertNone,
 		},
 		{
 			name:    "literal value rejected",
@@ -75,7 +79,156 @@ func TestParseInsert(t *testing.T) {
 			if pq.numPlaceholders != tc.wantN {
 				t.Fatalf("numPlaceholders = %d, want %d", pq.numPlaceholders, tc.wantN)
 			}
+			if pq.upsert != tc.wantUpsert {
+				t.Fatalf("upsert = %d, want %d", pq.upsert, tc.wantUpsert)
+			}
 		})
+	}
+}
+
+func TestParseUpsert(t *testing.T) {
+	cases := []struct {
+		name       string
+		query      string
+		wantTable  string
+		wantCols   []string
+		wantN      int
+		wantUpsert upsertMode
+		wantErr    bool
+	}{
+		{
+			name:       "insert or replace",
+			query:      "INSERT OR REPLACE INTO People (PartitionKey, RowKey, Name) VALUES (?, ?, ?)",
+			wantTable:  "People",
+			wantCols:   []string{"PartitionKey", "RowKey", "Name"},
+			wantN:      3,
+			wantUpsert: upsertReplace,
+		},
+		{
+			name:       "insert or merge",
+			query:      "INSERT OR MERGE INTO People (PartitionKey, RowKey, Name) VALUES (?, ?, ?)",
+			wantTable:  "People",
+			wantCols:   []string{"PartitionKey", "RowKey", "Name"},
+			wantN:      3,
+			wantUpsert: upsertMerge,
+		},
+		{
+			name:       "upsert into defaults to replace",
+			query:      "UPSERT INTO People (PartitionKey, RowKey, Name) VALUES (?, ?, ?)",
+			wantTable:  "People",
+			wantCols:   []string{"PartitionKey", "RowKey", "Name"},
+			wantN:      3,
+			wantUpsert: upsertReplace,
+		},
+		{
+			name:       "lowercase insert or replace",
+			query:      "insert or replace into t (a, b) values (?, ?)",
+			wantTable:  "t",
+			wantCols:   []string{"a", "b"},
+			wantN:      2,
+			wantUpsert: upsertReplace,
+		},
+		{
+			name:       "lowercase insert or merge",
+			query:      "insert or merge into t (a, b) values (?, ?)",
+			wantTable:  "t",
+			wantCols:   []string{"a", "b"},
+			wantN:      2,
+			wantUpsert: upsertMerge,
+		},
+		{
+			name:       "lowercase upsert into",
+			query:      "upsert into t (a, b) values (?, ?)",
+			wantTable:  "t",
+			wantCols:   []string{"a", "b"},
+			wantN:      2,
+			wantUpsert: upsertReplace,
+		},
+		{
+			name:       "trailing semicolon",
+			query:      "UPSERT INTO T (A, B) VALUES (?, ?);",
+			wantTable:  "T",
+			wantCols:   []string{"A", "B"},
+			wantN:      2,
+			wantUpsert: upsertReplace,
+		},
+		{
+			name:    "upsert literal value rejected",
+			query:   "UPSERT INTO T (A, B) VALUES (?, 'x')",
+			wantErr: true,
+		},
+		{
+			name:    "upsert col/val count mismatch",
+			query:   "INSERT OR REPLACE INTO T (A, B, C) VALUES (?, ?)",
+			wantErr: true,
+		},
+		{
+			name:    "quoted placeholder rejected",
+			query:   "UPSERT INTO T (A, B) VALUES (?, '?')",
+			wantErr: true,
+		},
+		{
+			name:    "double-quoted placeholder rejected",
+			query:   `INSERT INTO T (A, B) VALUES ("?", ?)`,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pq, err := parseQuery(tc.query)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if pq.kind != qInsert {
+				t.Fatalf("kind = %d, want qInsert", pq.kind)
+			}
+			if pq.table != tc.wantTable {
+				t.Fatalf("table = %q, want %q", pq.table, tc.wantTable)
+			}
+			if len(pq.columns) != len(tc.wantCols) {
+				t.Fatalf("columns = %v, want %v", pq.columns, tc.wantCols)
+			}
+			for i, c := range pq.columns {
+				if c != tc.wantCols[i] {
+					t.Fatalf("columns[%d] = %q, want %q", i, c, tc.wantCols[i])
+				}
+			}
+			if pq.numPlaceholders != tc.wantN {
+				t.Fatalf("numPlaceholders = %d, want %d", pq.numPlaceholders, tc.wantN)
+			}
+			if pq.upsert != tc.wantUpsert {
+				t.Fatalf("upsert = %d, want %d", pq.upsert, tc.wantUpsert)
+			}
+		})
+	}
+}
+
+// TestParseInsertErrorMessageLabel verifies that UPSERT statements report
+// "UPSERT" (not "INSERT") in validation error messages.
+func TestParseInsertErrorMessageLabel(t *testing.T) {
+	_, err := parseQuery("UPSERT INTO T (A, B) VALUES (?, 'x')")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "UPSERT") {
+		t.Errorf("error = %q, want it to contain 'UPSERT'", err.Error())
+	}
+	if strings.Contains(err.Error(), "INSERT only") {
+		t.Errorf("error = %q, should not say 'INSERT only' for a UPSERT statement", err.Error())
+	}
+
+	_, err = parseQuery("INSERT INTO T (A, B) VALUES (?, 'x')")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "INSERT") {
+		t.Errorf("error = %q, want it to contain 'INSERT'", err.Error())
 	}
 }
 

@@ -79,9 +79,46 @@ func (s *Stmt) execInsert(ctx context.Context, args []driver.Value) (driver.Resu
 	}
 	client := s.conn.svc.NewClient(s.pq.table)
 
+	entity, err := buildInsertEntity(s.pq.columns, args)
+	if err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(entity)
+	if err != nil {
+		return nil, err
+	}
+
+	switch s.pq.upsert {
+	case upsertNone:
+		if _, err := client.AddEntity(ctx, b, nil); err != nil {
+			return nil, err
+		}
+	case upsertReplace:
+		if _, err := client.UpsertEntity(ctx, b, &aztables.UpsertEntityOptions{
+			UpdateMode: aztables.UpdateModeReplace,
+		}); err != nil {
+			return nil, err
+		}
+	case upsertMerge:
+		if _, err := client.UpsertEntity(ctx, b, &aztables.UpsertEntityOptions{
+			UpdateMode: aztables.UpdateModeMerge,
+		}); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("aztablessql: unknown upsert mode %d", s.pq.upsert)
+	}
+	return driverResult{rowsAffected: 1}, nil
+}
+
+// buildInsertEntity assembles an aztables.EDMEntity from the INSERT column
+// list and argument values. PartitionKey and RowKey are pulled out of the
+// properties map into the entity's key fields; all other columns become
+// EDM-typed properties. Both key columns are required.
+func buildInsertEntity(columns []string, args []driver.Value) (aztables.EDMEntity, error) {
 	entity := aztables.EDMEntity{Properties: map[string]interface{}{}}
 	hasPK, hasRK := false, false
-	for i, col := range s.pq.columns {
+	for i, col := range columns {
 		switch strings.ToLower(col) {
 		case "partitionkey":
 			entity.PartitionKey = fmt.Sprintf("%v", args[i])
@@ -94,17 +131,9 @@ func (s *Stmt) execInsert(ctx context.Context, args []driver.Value) (driver.Resu
 		}
 	}
 	if !hasPK || !hasRK {
-		return nil, errors.New("aztablessql: INSERT requires PartitionKey and RowKey columns")
+		return entity, errors.New("aztablessql: INSERT requires PartitionKey and RowKey columns")
 	}
-
-	b, err := json.Marshal(entity)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := client.AddEntity(ctx, b, nil); err != nil {
-		return nil, err
-	}
-	return driverResult{rowsAffected: 1}, nil
+	return entity, nil
 }
 
 // ---------------------------------------------------------------------------

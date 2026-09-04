@@ -426,3 +426,195 @@ func TestIntegration_UpdateRejectsMissingWhere(t *testing.T) {
 	}
 	t.Logf("got expected error: %v", err)
 }
+
+// scanOne reads exactly one row from rows and returns it as a column→value
+// map. It closes rows and fails the test if there is not exactly one row.
+func scanOne(t *testing.T, rows *sql.Rows) map[string]interface{} {
+	t.Helper()
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	if !rows.Next() {
+		t.Fatal("expected 1 row, got 0")
+	}
+	vals := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	m := make(map[string]interface{}, len(cols))
+	for i, c := range cols {
+		m[c] = vals[i]
+	}
+	if rows.Next() {
+		t.Fatal("expected 1 row, got >1")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return m
+}
+
+func TestIntegration_UpsertReplaceInsertsNew(t *testing.T) {
+	table := uniqueTable("UpsIns")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	// INSERT OR REPLACE on a non-existent entity must create it.
+	_, err := db.Exec(
+		`INSERT OR REPLACE INTO `+table+` (PartitionKey, RowKey, Name, Age) VALUES (?, ?, ?, ?)`,
+		"pk", "rk", "Ada", 36,
+	)
+	if err != nil {
+		t.Fatalf("INSERT OR REPLACE (new): %v", err)
+	}
+
+	rows, err := db.Query(
+		`SELECT * FROM `+table+` WHERE PartitionKey = ? AND RowKey = ?`,
+		"pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	m := scanOne(t, rows)
+	if fmt.Sprintf("%v", m["Name"]) != "Ada" {
+		t.Errorf("Name = %v, want 'Ada'", m["Name"])
+	}
+	if fmt.Sprintf("%v", m["Age"]) != "36" {
+		t.Errorf("Age = %v, want 36", m["Age"])
+	}
+}
+
+func TestIntegration_UpsertReplaceOverwritesAndDropsProperties(t *testing.T) {
+	table := uniqueTable("UpsRepl")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	// Seed with Name and Age.
+	_, err := db.Exec(
+		`INSERT INTO `+table+` (PartitionKey, RowKey, Name, Age) VALUES (?, ?, ?, ?)`,
+		"pk", "rk", "Ada", 36,
+	)
+	if err != nil {
+		t.Fatalf("INSERT seed: %v", err)
+	}
+
+	// INSERT OR REPLACE with only Name — replace semantics drop Age.
+	_, err = db.Exec(
+		`INSERT OR REPLACE INTO `+table+` (PartitionKey, RowKey, Name) VALUES (?, ?, ?)`,
+		"pk", "rk", "Grace",
+	)
+	if err != nil {
+		t.Fatalf("INSERT OR REPLACE (overwrite): %v", err)
+	}
+
+	rows, err := db.Query(
+		`SELECT * FROM `+table+` WHERE PartitionKey = ? AND RowKey = ?`,
+		"pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	m := scanOne(t, rows)
+	if fmt.Sprintf("%v", m["Name"]) != "Grace" {
+		t.Errorf("Name = %v, want 'Grace'", m["Name"])
+	}
+	if _, hasAge := m["Age"]; hasAge {
+		t.Errorf("Age = %v present after replace, want dropped (replace semantics)", m["Age"])
+	}
+}
+
+func TestIntegration_UpsertMergePreservesUntouchedProperties(t *testing.T) {
+	table := uniqueTable("UpsMerge")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	// Seed with Name and Age.
+	_, err := db.Exec(
+		`INSERT INTO `+table+` (PartitionKey, RowKey, Name, Age) VALUES (?, ?, ?, ?)`,
+		"pk", "rk", "Ada", 36,
+	)
+	if err != nil {
+		t.Fatalf("INSERT seed: %v", err)
+	}
+
+	// INSERT OR MERGE with only Name — merge semantics preserve Age.
+	_, err = db.Exec(
+		`INSERT OR MERGE INTO `+table+` (PartitionKey, RowKey, Name) VALUES (?, ?, ?)`,
+		"pk", "rk", "Grace",
+	)
+	if err != nil {
+		t.Fatalf("INSERT OR MERGE (overwrite): %v", err)
+	}
+
+	rows, err := db.Query(
+		`SELECT * FROM `+table+` WHERE PartitionKey = ? AND RowKey = ?`,
+		"pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	m := scanOne(t, rows)
+	if fmt.Sprintf("%v", m["Name"]) != "Grace" {
+		t.Errorf("Name = %v, want 'Grace'", m["Name"])
+	}
+	if age, ok := m["Age"]; !ok || fmt.Sprintf("%v", age) != "36" {
+		t.Errorf("Age = %v (ok=%v), want 36 (merge should preserve)", age, ok)
+	}
+}
+
+func TestIntegration_UpsertAliasInsertsNew(t *testing.T) {
+	table := uniqueTable("UpsAlias")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	// UPSERT INTO is an alias for INSERT OR REPLACE.
+	_, err := db.Exec(
+		`UPSERT INTO `+table+` (PartitionKey, RowKey, Name) VALUES (?, ?, ?)`,
+		"pk", "rk", "Ada",
+	)
+	if err != nil {
+		t.Fatalf("UPSERT INTO (new): %v", err)
+	}
+
+	rows, err := db.Query(
+		`SELECT * FROM `+table+` WHERE PartitionKey = ? AND RowKey = ?`,
+		"pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	m := scanOne(t, rows)
+	if fmt.Sprintf("%v", m["Name"]) != "Ada" {
+		t.Errorf("Name = %v, want 'Ada'", m["Name"])
+	}
+}
+
+func TestIntegration_QuotedPlaceholderRejected(t *testing.T) {
+	table := uniqueTable("QuotPh")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	// A quoted '?' is a string literal, not a placeholder, and must be
+	// rejected at parse time — not silently accepted as a placeholder.
+	_, err := db.Exec(
+		`INSERT INTO `+table+` (PartitionKey, RowKey, Name) VALUES (?, ?, '?')`,
+		"pk", "rk",
+	)
+	if err == nil {
+		t.Fatal("expected INSERT with quoted '?' to fail, got nil")
+	}
+	t.Logf("got expected error: %v", err)
+
+	// Same for UPSERT.
+	_, err = db.Exec(
+		`UPSERT INTO `+table+` (PartitionKey, RowKey, Name) VALUES (?, ?, '?')`,
+		"pk", "rk",
+	)
+	if err == nil {
+		t.Fatal("expected UPSERT with quoted '?' to fail, got nil")
+	}
+	t.Logf("got expected error: %v", err)
+}

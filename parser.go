@@ -16,6 +16,18 @@ const (
 	qUpdate
 )
 
+// upsertMode distinguishes the three INSERT-family execution strategies.
+//   - upsertNone    : plain INSERT  → client.AddEntity (fails on existing entity)
+//   - upsertReplace : INSERT OR REPLACE / UPSERT INTO → UpsertEntity(Replace)
+//   - upsertMerge   : INSERT OR MERGE → UpsertEntity(Merge)
+type upsertMode int
+
+const (
+	upsertNone upsertMode = iota
+	upsertReplace
+	upsertMerge
+)
+
 type whereCond struct {
 	column        string
 	isPlaceholder bool
@@ -38,10 +50,15 @@ type parsedQuery struct {
 	numPlaceholders   int // total, in argument order: SET placeholders then WHERE placeholders
 	setPlaceholders   int
 	wherePlaceholders int
+	upsert            upsertMode // INSERT-family execution strategy
 }
 
 var (
 	insertRe = regexp.MustCompile(`(?is)^INSERT\s+INTO\s+([A-Za-z0-9_]+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)\s*;?\s*$`)
+	// upsertRe matches INSERT OR REPLACE / INSERT OR MERGE / UPSERT INTO.
+	// Group 1 is the REPLACE|MERGE keyword (empty for the bare UPSERT form,
+	// which defaults to replace semantics). Groups 2/3/4 are table/cols/vals.
+	upsertRe = regexp.MustCompile(`(?is)^(?:INSERT\s+OR\s+(REPLACE|MERGE)|UPSERT)\s+INTO\s+([A-Za-z0-9_]+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)\s*;?\s*$`)
 	deleteRe = regexp.MustCompile(`(?is)^DELETE\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*;?\s*$`)
 	selectRe = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*;?\s*$`)
 	// updatePrefixRe matches the "UPDATE <table> SET " prefix. The SET and
@@ -57,19 +74,24 @@ var (
 func parseQuery(query string) (*parsedQuery, error) {
 	q := strings.TrimSpace(query)
 
+	if m := upsertRe.FindStringSubmatch(q); m != nil {
+		mode := upsertReplace // UPSERT INTO defaults to replace
+		if strings.EqualFold(m[1], "MERGE") {
+			mode = upsertMerge
+		}
+		cols, _, err := parseInsertColsVals("UPSERT", m[3], m[4])
+		if err != nil {
+			return nil, err
+		}
+		return &parsedQuery{kind: qInsert, table: m[2], columns: cols, numPlaceholders: len(cols), upsert: mode}, nil
+	}
+
 	if m := insertRe.FindStringSubmatch(q); m != nil {
-		table := m[1]
-		cols := splitAndTrim(m[2], ",")
-		vals := splitAndTrim(m[3], ",")
-		if len(cols) != len(vals) {
-			return nil, fmt.Errorf("aztablessql: INSERT column/value count mismatch")
+		cols, _, err := parseInsertColsVals("INSERT", m[2], m[3])
+		if err != nil {
+			return nil, err
 		}
-		for _, v := range vals {
-			if v != "?" {
-				return nil, fmt.Errorf("aztablessql: INSERT only supports placeholder values (?), got %q", v)
-			}
-		}
-		return &parsedQuery{kind: qInsert, table: table, columns: cols, numPlaceholders: len(cols)}, nil
+		return &parsedQuery{kind: qInsert, table: m[1], columns: cols, numPlaceholders: len(cols), upsert: upsertNone}, nil
 	}
 
 	// UPDATE is parsed manually because the regex cannot be quote-aware
@@ -104,6 +126,36 @@ func parseQuery(query string) (*parsedQuery, error) {
 	}
 
 	return nil, fmt.Errorf("aztablessql: unsupported query: %q", q)
+}
+
+// parseInsertColsVals validates the (col1, col2, ...) / (val1, val2, ...)
+// pair from an INSERT-family statement. Column/value counts must match and
+// every value must be a bare "?" placeholder. The returned vals slice is
+// currently only used for the count check (placeholders carry no literal
+// payload).
+//
+// label is used in error messages so that "UPSERT INTO ..." statements don't
+// report "INSERT" errors.
+//
+// Values are split with splitOnComma (quote-aware, preserves quotes) and only
+// whitespace-trimmed, so a quoted literal like '?' is NOT mistaken for a
+// placeholder — it is rejected. Columns use splitAndTrim which strips
+// surrounding quotes (column names are not quoted in practice).
+func parseInsertColsVals(label, colsStr, valsStr string) ([]string, []string, error) {
+	cols := splitAndTrim(colsStr, ",")
+	rawVals := splitOnComma(valsStr)
+	if len(cols) != len(rawVals) {
+		return nil, nil, fmt.Errorf("aztablessql: %s column/value count mismatch", label)
+	}
+	vals := make([]string, 0, len(rawVals))
+	for _, v := range rawVals {
+		t := strings.TrimSpace(v)
+		if t != "?" {
+			return nil, nil, fmt.Errorf("aztablessql: %s only supports placeholder values (?), got %q", label, v)
+		}
+		vals = append(vals, t)
+	}
+	return cols, vals, nil
 }
 
 // parseUpdateQuery parses the remainder after "UPDATE <table> SET ".

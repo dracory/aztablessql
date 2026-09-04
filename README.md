@@ -54,6 +54,15 @@ func main() {
         log.Fatal(err)
     }
 
+    // UPSERT — insert or replace (no prior existence check, no race)
+    _, err = db.Exec(
+        `INSERT OR REPLACE INTO People (PartitionKey, RowKey, Name) VALUES (?, ?, ?)`,
+        "pk1", "rk1", "Ada Lovelace",
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
     // SELECT — point read (PartitionKey + RowKey)
     rows, err := db.Query(
         `SELECT * FROM People WHERE PartitionKey = ? AND RowKey = ?`,
@@ -101,10 +110,22 @@ func main() {
 
 | Statement | Syntax | Notes |
 |-----------|--------|-------|
-| **INSERT** | `INSERT INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | All values must be `?` placeholders. `PartitionKey` and `RowKey` columns are required. |
+| **INSERT** | `INSERT INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | All values must be `?` placeholders. `PartitionKey` and `RowKey` columns are required. Fails if the entity already exists. |
+| **INSERT OR REPLACE** | `INSERT OR REPLACE INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Upsert with replace semantics — if the entity exists, it is fully replaced (properties not in the column list are dropped). Maps to `UpsertEntity` with `UpdateModeReplace`. |
+| **INSERT OR MERGE** | `INSERT OR MERGE INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Upsert with merge semantics — if the entity exists, only the supplied properties are updated; existing properties are preserved. Maps to `UpsertEntity` with `UpdateModeMerge`. |
+| **UPSERT INTO** | `UPSERT INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Alias for `INSERT OR REPLACE`. |
 | **SELECT** | `SELECT * FROM <table> [WHERE ...]` or `SELECT col1, col2 FROM <table> [WHERE ...]` | Point read when `WHERE PartitionKey = ? AND RowKey = ?` (uses `GetEntity`). Otherwise falls back to `ListEntities` with an OData filter. |
 | **UPDATE** | `UPDATE <table> SET col1 = ?, col2 = ? WHERE PartitionKey = ? AND RowKey = ?` | Merge semantics — only SET columns are touched, existing properties are preserved. `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`. Cannot SET `PartitionKey` or `RowKey`. |
 | **DELETE** | `DELETE FROM <table> WHERE PartitionKey = ? AND RowKey = ?` | `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`. Extra conditions are rejected. |
+
+### Upsert
+
+Table Storage's `UpsertEntity` inserts the entity if it does not exist, and either replaces or merges it if it does — without a prior existence check. This avoids the race condition inherent in a SELECT-then-INSERT/UPDATE pattern.
+
+- **`INSERT OR REPLACE`** / **`UPSERT INTO`** → replace semantics. The entity is overwritten entirely; properties absent from the column list are removed.
+- **`INSERT OR MERGE`** → merge semantics. Only the supplied properties are written; existing properties are left untouched.
+
+Both require `PartitionKey` and `RowKey` in the column list, just like `INSERT`.
 
 ### WHERE clause
 
