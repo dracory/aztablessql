@@ -129,15 +129,32 @@ Both require `PartitionKey` and `RowKey` in the column list, just like `INSERT`.
 
 ### WHERE clause
 
-- Supports `col = ?` (placeholder) and `col = 'literal'` / `col = "literal"` (string literal)
+- Comparison operators: `=`, `!=` (or `<>`), `>`, `>=`, `<`, `<=`
+- Right-hand side is a `?` placeholder or a quoted string literal (`'literal'` or `"literal"`)
 - Multiple conditions joined by `AND` only (no `OR`)
 - Column names are case-sensitive for user properties; `PartitionKey` and `RowKey` are matched case-insensitively
-- String literals can contain commas and the word `AND` — the parser is quote-aware
+- String literals can contain commas, the word `AND`, and operator characters — the parser is quote-aware
+- `<>` is accepted as an alias for `!=` and normalized internally to `ne` (OData has no `<>`)
+
+#### SELECT WHERE
+
+`SELECT` supports all comparison operators. A query is treated as a **point read** (using `GetEntity`) only when the `WHERE` clause is exactly `PartitionKey = ? AND RowKey = ?` with both operators being `=`. Any other predicate — including range scans like `PartitionKey >= 'a' AND PartitionKey < 'b'` or `RowKey > ?` — falls back to `ListEntities` with an OData filter.
+
+```sql
+SELECT * FROM People WHERE PartitionKey = ? AND Age > ?
+SELECT * FROM People WHERE PartitionKey >= 'a' AND PartitionKey < 'b'
+SELECT * FROM People WHERE Name != 'Bob'
+```
+
+#### UPDATE / DELETE WHERE
+
+`UPDATE` and `DELETE` are **point operations only**. Their `WHERE` clause must be exactly `PartitionKey = ? AND RowKey = ?` (literals also accepted), and both operators must be `=`. Non-`=` operators on the key columns are rejected at parse time, as are any extra conditions. This is intentional: Table Storage has no conditional range delete, and accepting a non-`=` predicate would silently delete/update the wrong single entity.
 
 ### What's NOT supported
 
 - Joins, subqueries, `ORDER BY`, `LIMIT`, `TOP`, `GROUP BY`
-- `OR`, `<>`, `LIKE`, `IS NULL`, `IN`, comparison operators (`>`, `<`, `>=`, `<=`)
+- `OR`, `LIKE`, `IS NULL`, `IN`
+- Bare numeric literals in `WHERE` (use a `?` placeholder or a quoted string literal instead)
 - Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`)
 - Optimistic concurrency (ETag / `If-Match`)
 - Batch operations

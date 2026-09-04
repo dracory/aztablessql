@@ -253,14 +253,33 @@ func TestParseDelete(t *testing.T) {
 			wantN:     0,
 		},
 		{
-			name:      "no where",
-			query:     "DELETE FROM People",
-			wantTable: "People",
-			wantN:     0,
+			name:    "no where rejected",
+			query:   "DELETE FROM People",
+			wantErr: true,
 		},
 		{
-			name:    "unsupported operator",
-			query:   "DELETE FROM People WHERE Age > 5",
+			name:    "unsupported syntax",
+			query:   "DELETE FROM People WHERE Age LIKE 'x'",
+			wantErr: true,
+		},
+		{
+			name:    "rowkey greater than rejected",
+			query:   "DELETE FROM People WHERE PartitionKey = 'pk' AND RowKey > 'rk'",
+			wantErr: true,
+		},
+		{
+			name:    "partitionkey less than rejected",
+			query:   "DELETE FROM People WHERE PartitionKey < 'pk' AND RowKey = 'rk'",
+			wantErr: true,
+		},
+		{
+			name:    "rowkey not equal rejected",
+			query:   "DELETE FROM People WHERE PartitionKey = ? AND RowKey != ?",
+			wantErr: true,
+		},
+		{
+			name:    "extra non-key condition rejected",
+			query:   "DELETE FROM People WHERE PartitionKey = ? AND RowKey = ? AND Age > ?",
 			wantErr: true,
 		},
 	}
@@ -406,6 +425,107 @@ func TestParseUpdate(t *testing.T) {
 	}
 }
 
+func TestParseSetRejectsNonEqOperators(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"greater than", "UPDATE People SET Age > ? WHERE PartitionKey = ? AND RowKey = ?"},
+		{"less than", "UPDATE People SET Age < ? WHERE PartitionKey = ? AND RowKey = ?"},
+		{"not equal", "UPDATE People SET Age != ? WHERE PartitionKey = ? AND RowKey = ?"},
+		{"diamond", "UPDATE People SET Age <> ? WHERE PartitionKey = ? AND RowKey = ?"},
+		{"greater or equal", "UPDATE People SET Age >= ? WHERE PartitionKey = ? AND RowKey = ?"},
+		{"less or equal", "UPDATE People SET Age <= ? WHERE PartitionKey = ? AND RowKey = ?"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseQuery(tc.query)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), "SET only supports =") {
+				t.Errorf("error = %q, want it to contain 'SET only supports ='", err.Error())
+			}
+		})
+	}
+}
+
+func TestParseDeleteRejectsNonEqWhere(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"rowkey greater than", "DELETE FROM People WHERE PartitionKey = ? AND RowKey > ?"},
+		{"partitionkey less than", "DELETE FROM People WHERE PartitionKey < ? AND RowKey = ?"},
+		{"rowkey not equal", "DELETE FROM People WHERE PartitionKey = ? AND RowKey != ?"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseQuery(tc.query)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), "DELETE WHERE only supports =") {
+				t.Errorf("error = %q, want it to contain 'DELETE WHERE only supports ='", err.Error())
+			}
+		})
+	}
+}
+
+func TestParseUpdateRejectsNonEqWhere(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"rowkey greater than", "UPDATE People SET Age = ? WHERE PartitionKey = ? AND RowKey > ?"},
+		{"partitionkey less than", "UPDATE People SET Age = ? WHERE PartitionKey < ? AND RowKey = ?"},
+		{"rowkey not equal", "UPDATE People SET Age = ? WHERE PartitionKey = ? AND RowKey != ?"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseQuery(tc.query)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), "UPDATE WHERE only supports =") {
+				t.Errorf("error = %q, want it to contain 'UPDATE WHERE only supports ='", err.Error())
+			}
+		})
+	}
+}
+
+func TestParseSelectOperatorCanonicalization(t *testing.T) {
+	// "<>" is normalized to "!=" at parse time.
+	pq, err := parseQuery("SELECT * FROM T WHERE Name <> 'Bob'")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.where) != 1 {
+		t.Fatalf("expected 1 condition, got %d", len(pq.where))
+	}
+	if pq.where[0].op != "!=" {
+		t.Errorf("where[0].op = %q, want %q", pq.where[0].op, "!=")
+	}
+}
+
+func TestParseWhereOperatorWithLiteralContainingOperatorChar(t *testing.T) {
+	// A quoted literal containing an operator character must not confuse
+	// the operator-aware regex.
+	pq, err := parseQuery("SELECT * FROM T WHERE Name = 'a>b'")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.where) != 1 {
+		t.Fatalf("expected 1 condition, got %d", len(pq.where))
+	}
+	if pq.where[0].op != "=" {
+		t.Errorf("where[0].op = %q, want %q", pq.where[0].op, "=")
+	}
+	if pq.where[0].value != "a>b" {
+		t.Errorf("where[0].value = %q, want %q", pq.where[0].value, "a>b")
+	}
+}
+
 func TestParseSelect(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -438,8 +558,57 @@ func TestParseSelect(t *testing.T) {
 			wantN:     0,
 		},
 		{
+			name:      "greater than literal",
+			query:     "SELECT * FROM People WHERE Age > '30'",
+			wantTable: "People",
+			wantAll:   true,
+			wantN:     0,
+		},
+		{
+			name:      "less than placeholder",
+			query:     "SELECT * FROM People WHERE Age < ?",
+			wantTable: "People",
+			wantAll:   true,
+			wantN:     1,
+		},
+		{
+			name:      "greater or equal",
+			query:     "SELECT * FROM People WHERE Age >= '30'",
+			wantTable: "People",
+			wantAll:   true,
+			wantN:     0,
+		},
+		{
+			name:      "less or equal",
+			query:     "SELECT * FROM People WHERE Age <= '30'",
+			wantTable: "People",
+			wantAll:   true,
+			wantN:     0,
+		},
+		{
+			name:      "not equal bang",
+			query:     "SELECT * FROM People WHERE Name != 'Bob'",
+			wantTable: "People",
+			wantAll:   true,
+			wantN:     0,
+		},
+		{
+			name:      "not equal diamond",
+			query:     "SELECT * FROM People WHERE Name <> 'Bob'",
+			wantTable: "People",
+			wantAll:   true,
+			wantN:     0,
+		},
+		{
+			name:      "partition range scan",
+			query:     "SELECT * FROM People WHERE PartitionKey >= 'a' AND PartitionKey < 'b'",
+			wantTable: "People",
+			wantAll:   true,
+			wantN:     0,
+		},
+		{
 			name:    "unsupported where",
-			query:   "SELECT * FROM People WHERE Age <> 5",
+			query:   "SELECT * FROM People WHERE Age LIKE 'x'",
 			wantErr: true,
 		},
 	}
@@ -514,6 +683,26 @@ func TestParseSetWithCommaInLiteral(t *testing.T) {
 	}
 	if pq.set[0].column != "Name" || pq.set[0].value != "Doe, Jr" {
 		t.Errorf("set[0] = {col: %q, val: %q}, want {col: \"Name\", val: \"Doe, Jr\"}", pq.set[0].column, pq.set[0].value)
+	}
+	if pq.set[1].column != "Age" || !pq.set[1].isPlaceholder {
+		t.Errorf("set[1] = {col: %q, placeholder: %v}, want {col: \"Age\", placeholder: true}", pq.set[1].column, pq.set[1].isPlaceholder)
+	}
+}
+
+// TestParseSetWithOperatorCharInLiteral verifies that an operator character
+// inside a quoted SET literal is not mistaken for a comparison operator.
+// parseSet uses the same operator-aware condRe as parseWhere, so a literal
+// like 'a>b' must be parsed as a value, not split on '>'.
+func TestParseSetWithOperatorCharInLiteral(t *testing.T) {
+	pq, err := parseQuery("UPDATE People SET Name = 'a>b', Age = ? WHERE PartitionKey = ? AND RowKey = ?")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.set) != 2 {
+		t.Fatalf("expected 2 SET assignments, got %d", len(pq.set))
+	}
+	if pq.set[0].column != "Name" || pq.set[0].value != "a>b" {
+		t.Errorf("set[0] = {col: %q, val: %q}, want {col: \"Name\", val: \"a>b\"}", pq.set[0].column, pq.set[0].value)
 	}
 	if pq.set[1].column != "Age" || !pq.set[1].isPlaceholder {
 		t.Errorf("set[1] = {col: %q, placeholder: %v}, want {col: \"Age\", placeholder: true}", pq.set[1].column, pq.set[1].isPlaceholder)
@@ -698,5 +887,230 @@ func TestParseWherePreservesColumnCase(t *testing.T) {
 	}
 	if pq.where[1].column != "PartitionKey" {
 		t.Fatalf("where[1].column = %q, want %q", pq.where[1].column, "PartitionKey")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regex flag and boundary-condition coverage
+// ---------------------------------------------------------------------------
+
+// TestParseNewlinesAcrossStatements verifies that the (?is) dotall flag on
+// every top-level regex makes "." match newlines, so statements split across
+// multiple lines parse correctly. Only UPDATE had newline coverage before.
+func TestParseNewlinesAcrossStatements(t *testing.T) {
+	cases := []struct {
+		name      string
+		query     string
+		wantKind  queryType
+		wantTable string
+	}{
+		{
+			name:      "select across newlines",
+			query:     "SELECT *\nFROM People\nWHERE PartitionKey = ?\nAND RowKey = ?",
+			wantKind:  qSelect,
+			wantTable: "People",
+		},
+		{
+			name:      "insert across newlines",
+			query:     "INSERT INTO People\n(PartitionKey, RowKey, Name)\nVALUES (?, ?, ?)",
+			wantKind:  qInsert,
+			wantTable: "People",
+		},
+		{
+			name:      "upsert across newlines",
+			query:     "INSERT OR REPLACE INTO People\n(PartitionKey, RowKey, Name)\nVALUES (?, ?, ?)",
+			wantKind:  qInsert,
+			wantTable: "People",
+		},
+		{
+			name:      "delete across newlines",
+			query:     "DELETE FROM People\nWHERE PartitionKey = ?\nAND RowKey = ?",
+			wantKind:  qDelete,
+			wantTable: "People",
+		},
+		{
+			name:      "select with carriage returns",
+			query:     "SELECT *\r\nFROM People\r\nWHERE PartitionKey = ?",
+			wantKind:  qSelect,
+			wantTable: "People",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pq, err := parseQuery(tc.query)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if pq.kind != tc.wantKind {
+				t.Errorf("kind = %d, want %d", pq.kind, tc.wantKind)
+			}
+			if pq.table != tc.wantTable {
+				t.Errorf("table = %q, want %q", pq.table, tc.wantTable)
+			}
+		})
+	}
+}
+
+// TestParseTrailingSemicolons verifies that the optional ;? at the end of
+// each regex is exercised for SELECT and DELETE (INSERT/UPSERT/UPDATE
+// already have semicolon tests).
+func TestParseTrailingSemicolons(t *testing.T) {
+	cases := []struct {
+		name      string
+		query     string
+		wantKind  queryType
+		wantTable string
+	}{
+		{"select with semicolon", "SELECT * FROM People;", qSelect, "People"},
+		{"select with semicolon and where", "SELECT * FROM People WHERE PartitionKey = ?;", qSelect, "People"},
+		{"select with semicolon and where literal", "SELECT * FROM People WHERE PartitionKey = 'pk';", qSelect, "People"},
+		{"delete with semicolon", "DELETE FROM People WHERE PartitionKey = ? AND RowKey = ?;", qDelete, "People"},
+		{"select no semicolon", "SELECT * FROM People", qSelect, "People"},
+		{"delete no semicolon", "DELETE FROM People WHERE PartitionKey = ? AND RowKey = ?", qDelete, "People"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pq, err := parseQuery(tc.query)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if pq.kind != tc.wantKind {
+				t.Errorf("kind = %d, want %d", pq.kind, tc.wantKind)
+			}
+			if pq.table != tc.wantTable {
+				t.Errorf("table = %q, want %q", pq.table, tc.wantTable)
+			}
+		})
+	}
+}
+
+// TestParseExtraWhitespaceBetweenKeywords verifies that \s+ in the regexes
+// tolerates multiple spaces / tabs between keywords.
+func TestParseExtraWhitespaceBetweenKeywords(t *testing.T) {
+	cases := []struct {
+		name      string
+		query     string
+		wantKind  queryType
+		wantTable string
+	}{
+		{"select double spaces", "SELECT  *  FROM  People  WHERE  PartitionKey = ?", qSelect, "People"},
+		{"select tabs", "SELECT\t*\tFROM\tPeople\tWHERE\tPartitionKey = ?", qSelect, "People"},
+		{"insert double spaces", "INSERT  INTO  People  (A, B)  VALUES  (?, ?)", qInsert, "People"},
+		{"upsert double spaces", "INSERT  OR  REPLACE  INTO  People  (A, B)  VALUES  (?, ?)", qInsert, "People"},
+		{"delete double spaces", "DELETE  FROM  People  WHERE  PartitionKey = ?  AND  RowKey = ?", qDelete, "People"},
+		{"update double spaces", "UPDATE  People  SET  Name = ?  WHERE  PartitionKey = ?  AND  RowKey = ?", qUpdate, "People"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pq, err := parseQuery(tc.query)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if pq.kind != tc.wantKind {
+				t.Errorf("kind = %d, want %d", pq.kind, tc.wantKind)
+			}
+			if pq.table != tc.wantTable {
+				t.Errorf("table = %q, want %q", pq.table, tc.wantTable)
+			}
+		})
+	}
+}
+
+// TestParseEmptyColumnValueLists verifies that empty () in INSERT/UPSERT
+// is rejected (the [^)]+ group requires at least one character).
+func TestParseEmptyColumnValueLists(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"insert empty cols", "INSERT INTO T () VALUES (?)"},
+		{"insert empty vals", "INSERT INTO T (A) VALUES ()"},
+		{"insert both empty", "INSERT INTO T () VALUES ()"},
+		{"upsert empty cols", "UPSERT INTO T () VALUES (?)"},
+		{"upsert empty vals", "UPSERT INTO T (A) VALUES ()"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseQuery(tc.query)
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tc.query)
+			}
+		})
+	}
+}
+
+// TestParseSelectSemicolonWithWhereInteraction verifies the non-greedy
+// WHERE capture group (.+?) interacts correctly with the trailing ;?\s*$
+// — the semicolon must not be captured as part of the WHERE clause.
+func TestParseSelectSemicolonWithWhereInteraction(t *testing.T) {
+	pq, err := parseQuery("SELECT * FROM T WHERE PartitionKey = 'pk' AND RowKey = 'rk';")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.where) != 2 {
+		t.Fatalf("expected 2 WHERE conditions, got %d (semicolon may have leaked into capture)", len(pq.where))
+	}
+	if pq.where[0].column != "PartitionKey" || pq.where[0].value != "pk" {
+		t.Errorf("where[0] = {col: %q, val: %q}, want {PartitionKey, pk}", pq.where[0].column, pq.where[0].value)
+	}
+	if pq.where[1].column != "RowKey" || pq.where[1].value != "rk" {
+		t.Errorf("where[1] = {col: %q, val: %q}, want {RowKey, rk}", pq.where[1].column, pq.where[1].value)
+	}
+}
+
+// TestParseDegenerateCondReInputs verifies that condRe rejects malformed
+// conditions that are not valid column-operator-value triples.
+func TestParseDegenerateCondReInputs(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"missing column", "SELECT * FROM T WHERE = ?"},
+		{"missing value", "SELECT * FROM T WHERE Name ="},
+		{"missing both", "SELECT * FROM T WHERE ="},
+		{"operator only", "SELECT * FROM T WHERE >"},
+		{"column only", "SELECT * FROM T WHERE Name"},
+		{"empty where", "SELECT * FROM T WHERE "},
+		{"double operator", "SELECT * FROM T WHERE Name == ?"},
+		{"triple operator", "SELECT * FROM T WHERE Name === 'x'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseQuery(tc.query)
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tc.query)
+			}
+		})
+	}
+}
+
+// TestParseCondReOperatorWhitespace verifies that whitespace around the
+// operator is tolerated (\s* in condRe).
+func TestParseCondReOperatorWhitespace(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{"no spaces around =", "SELECT * FROM T WHERE Name='Bob'", "Bob"},
+		{"space before =", "SELECT * FROM T WHERE Name = 'Bob'", "Bob"},
+		{"space after =", "SELECT * FROM T WHERE Name= 'Bob'", "Bob"},
+		{"spaces around >", "SELECT * FROM T WHERE Age > '30'", "30"},
+		{"no spaces around >=", "SELECT * FROM T WHERE Age>='30'", "30"},
+		{"tab around !=", "SELECT * FROM T WHERE Name!=\t'Bob'", "Bob"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pq, err := parseQuery(tc.query)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(pq.where) != 1 {
+				t.Fatalf("expected 1 condition, got %d", len(pq.where))
+			}
+			if pq.where[0].value != tc.want {
+				t.Errorf("where[0].value = %q, want %q", pq.where[0].value, tc.want)
+			}
+		})
 	}
 }

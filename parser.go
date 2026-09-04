@@ -30,6 +30,7 @@ const (
 
 type whereCond struct {
 	column        string
+	op            string // "=", "!=", ">", ">=", "<", "<=" (canonical; "<>" normalized to "!=")
 	isPlaceholder bool
 	value         string // literal value, only set when !isPlaceholder
 }
@@ -65,10 +66,12 @@ var (
 	// WHERE clauses are split manually by findUpdateSplit, which is
 	// quote-aware and handles quoted literals containing the word WHERE.
 	updatePrefixRe = regexp.MustCompile(`(?is)^UPDATE\s+([A-Za-z0-9_]+)\s+SET\s+`)
-	// condRe matches a single condition: col = ? | 'literal' | "literal".
+	// condRe matches a single condition: col <op> ? | 'literal' | "literal".
+	// The operator is one of =, !=, <>, >=, <=, >, <. "<>" is normalized to
+	// "!=" at parse time so there is a single canonical form internally.
 	// The single-quoted pattern ('(?:[^']|'')*') handles SQL-style doubled
 	// quote escapes ('') inside the literal. Same for double quotes.
-	condRe = regexp.MustCompile(`(?i)^([A-Za-z0-9_]+)\s*=\s*(\?|'(?:[^']|'')*'|"(?:[^"]|"")*")$`)
+	condRe = regexp.MustCompile(`(?i)^([A-Za-z0-9_]+)\s*(=|!=|<>|>=|<=|>|<)\s*(\?|'(?:[^']|'')*'|"(?:[^"]|"")*")$`)
 )
 
 func parseQuery(query string) (*parsedQuery, error) {
@@ -104,6 +107,9 @@ func parseQuery(query string) (*parsedQuery, error) {
 		table := m[1]
 		conds, n, err := parseWhere(m[2])
 		if err != nil {
+			return nil, err
+		}
+		if err := validateDeleteWhere(conds); err != nil {
 			return nil, err
 		}
 		return &parsedQuery{kind: qDelete, table: table, where: conds, numPlaceholders: n}, nil
@@ -202,7 +208,10 @@ func parseSet(setStr string) ([]setAssign, int, error) {
 		if m == nil {
 			return nil, 0, fmt.Errorf("aztablessql: unsupported SET clause: %q", p)
 		}
-		col, tok := m[1], m[2]
+		col, op, tok := m[1], m[2], m[3]
+		if op != "=" {
+			return nil, 0, fmt.Errorf("aztablessql: SET only supports =, got %q", op)
+		}
 		if strings.EqualFold(col, "PartitionKey") || strings.EqualFold(col, "RowKey") {
 			return nil, 0, fmt.Errorf("aztablessql: cannot SET PartitionKey/RowKey")
 		}
@@ -222,6 +231,9 @@ func parseSet(setStr string) ([]setAssign, int, error) {
 func validateUpdateWhere(conds []whereCond) error {
 	var hasPK, hasRK bool
 	for _, c := range conds {
+		if c.op != "=" {
+			return fmt.Errorf("aztablessql: UPDATE WHERE only supports =, got %q for %q", c.op, c.column)
+		}
 		switch strings.ToLower(c.column) {
 		case "partitionkey":
 			hasPK = true
@@ -231,6 +243,29 @@ func validateUpdateWhere(conds []whereCond) error {
 	}
 	if !hasPK || !hasRK || len(conds) != 2 {
 		return fmt.Errorf("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ? (exactly)")
+	}
+	return nil
+}
+
+// validateDeleteWhere enforces that DELETE stays a point delete: exactly
+// PartitionKey = ? AND RowKey = ?, both with the "=" operator. Without this
+// check, a predicate like `WHERE PartitionKey = 'p' AND RowKey > 'r'` would
+// parse, resolve RowKey to "r", and silently delete the wrong entity.
+func validateDeleteWhere(conds []whereCond) error {
+	var hasPK, hasRK bool
+	for _, c := range conds {
+		if c.op != "=" {
+			return fmt.Errorf("aztablessql: DELETE WHERE only supports =, got %q for %q", c.op, c.column)
+		}
+		switch strings.ToLower(c.column) {
+		case "partitionkey":
+			hasPK = true
+		case "rowkey":
+			hasRK = true
+		}
+	}
+	if !hasPK || !hasRK || len(conds) != 2 {
+		return fmt.Errorf("aztablessql: DELETE requires WHERE PartitionKey = ? AND RowKey = ? (exactly)")
 	}
 	return nil
 }
@@ -248,12 +283,15 @@ func parseWhere(whereStr string) ([]whereCond, int, error) {
 		if m == nil {
 			return nil, 0, fmt.Errorf("aztablessql: unsupported WHERE condition: %q", p)
 		}
-		col, tok := m[1], m[2]
+		col, op, tok := m[1], m[2], m[3]
+		if op == "<>" {
+			op = "!=" // canonicalize; OData has no <>
+		}
 		if tok == "?" {
-			conds = append(conds, whereCond{column: col, isPlaceholder: true})
+			conds = append(conds, whereCond{column: col, op: op, isPlaceholder: true})
 			n++
 		} else {
-			conds = append(conds, whereCond{column: col, value: unquoteLiteral(tok)})
+			conds = append(conds, whereCond{column: col, op: op, value: unquoteLiteral(tok)})
 		}
 	}
 	return conds, n, nil

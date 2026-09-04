@@ -194,11 +194,13 @@ func (s *Stmt) execDelete(ctx context.Context, args []driver.Value) (driver.Resu
 	if err != nil {
 		return nil, err
 	}
-	// DELETE only supports a point delete on PartitionKey + RowKey.
-	// Any additional condition is rejected so the caller cannot accidentally
-	// delete a row that does not match their full predicate.
-	if len(conds) != 2 {
-		return nil, errors.New("aztablessql: DELETE requires exactly WHERE PartitionKey = ? AND RowKey = ?")
+	// DELETE only supports a point delete on PartitionKey + RowKey, both
+	// with "=". The parser enforces this via validateDeleteWhere; this is a
+	// defensive backstop in case a parsedQuery is constructed by other means.
+	if len(conds) != 2 ||
+		findKeyOp(conds, "PartitionKey") != "=" ||
+		findKeyOp(conds, "RowKey") != "=" {
+		return nil, errors.New("aztablessql: DELETE requires WHERE PartitionKey = ? AND RowKey = ? (point delete only)")
 	}
 	pk, ok1 := findKeyValue(conds, "PartitionKey")
 	rk, ok2 := findKeyValue(conds, "RowKey")
@@ -228,8 +230,11 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 
 	var entities [][]byte
 
-	// Point read: exactly PartitionKey + RowKey, nothing else.
-	if hasPK && hasRK && len(conds) == 2 {
+	// Point read: exactly PartitionKey + RowKey, both with "=" operator.
+	// A predicate like `WHERE PartitionKey = ? AND RowKey > ?` is a range
+	// scan and must go through ListEntities.
+	if hasPK && hasRK && len(conds) == 2 &&
+		findKeyOp(conds, "PartitionKey") == "=" && findKeyOp(conds, "RowKey") == "=" {
 		resp, err := client.GetEntity(ctx, pk, rk, nil)
 		if err != nil {
 			if isNotFound(err) {
@@ -265,6 +270,7 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 // correctly. Only PartitionKey / RowKey are matched case-insensitively.
 type resolvedCond struct {
 	column string
+	op     string // "=", "!=", ">", ">=", "<", "<="
 	value  driver.Value
 }
 
@@ -282,7 +288,7 @@ func resolveWhere(where []whereCond, args []driver.Value) ([]resolvedCond, error
 		} else {
 			val = c.value
 		}
-		out = append(out, resolvedCond{column: c.column, value: val})
+		out = append(out, resolvedCond{column: c.column, op: c.op, value: val})
 	}
 	return out, nil
 }
@@ -298,6 +304,18 @@ func findKeyValue(conds []resolvedCond, key string) (string, bool) {
 	return "", false
 }
 
+// findKeyOp performs a case-insensitive search for a key column
+// (PartitionKey or RowKey) and returns its operator. Returns "" when
+// the column is not present.
+func findKeyOp(conds []resolvedCond, key string) string {
+	for _, c := range conds {
+		if strings.EqualFold(c.column, key) {
+			return c.op
+		}
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // OData filter builder — type-aware
 // ---------------------------------------------------------------------------
@@ -306,7 +324,7 @@ func buildODataFilter(conds []resolvedCond) string {
 	var parts []string
 	for _, c := range conds {
 		name := normalizeKeyName(c.column)
-		parts = append(parts, formatODataPredicate(name, c.value))
+		parts = append(parts, formatODataPredicate(name, c.op, c.value))
 	}
 	return strings.Join(parts, " and ")
 }
@@ -324,38 +342,61 @@ func normalizeKeyName(col string) string {
 	return col
 }
 
-// formatODataPredicate renders a single `col eq <value>` OData predicate,
+// sqlOpToOData maps a SQL comparison operator to its OData filter equivalent.
+// OData has no "<>"; the parser canonicalizes "<>" to "!=" so only "!=" is
+// handled here.
+func sqlOpToOData(op string) string {
+	switch op {
+	case "=":
+		return "eq"
+	case "!=":
+		return "ne"
+	case ">":
+		return "gt"
+	case ">=":
+		return "ge"
+	case "<":
+		return "lt"
+	case "<=":
+		return "le"
+	default:
+		return "eq"
+	}
+}
+
+// formatODataPredicate renders a single `col <op> <value>` OData predicate,
 // quoting the value only when it is a string. Numeric and boolean values
 // are emitted unquoted so that OData type matching works correctly.
 // time.Time is formatted as an OData datetime literal. []byte is formatted
 // as an Edm.Binary literal (X'hex').
-func formatODataPredicate(col string, val driver.Value) string {
+func formatODataPredicate(col, op string, val driver.Value) string {
+	odataOp := sqlOpToOData(op)
 	switch v := val.(type) {
 	case string:
-		return fmt.Sprintf("%s eq '%s'", col, strings.ReplaceAll(v, "'", "''"))
+		return fmt.Sprintf("%s %s '%s'", col, odataOp, strings.ReplaceAll(v, "'", "''"))
 	case bool:
-		return fmt.Sprintf("%s eq %t", col, v)
+		return fmt.Sprintf("%s %s %t", col, odataOp, v)
 	case int:
-		return fmt.Sprintf("%s eq %d", col, v)
+		return fmt.Sprintf("%s %s %d", col, odataOp, v)
 	case int64:
-		return fmt.Sprintf("%s eq %d", col, v)
+		return fmt.Sprintf("%s %s %d", col, odataOp, v)
 	case float64:
 		// JSON numbers arrive as float64. Emit as integer when the value
 		// is a whole number to avoid `42.000000` in the filter.
 		// Guard against overflow: if the value exceeds int64 range, emit
 		// as a float instead of wrapping.
 		if v >= -9.2233720368547758e+18 && v <= 9.2233720368547758e+18 && v == float64(int64(v)) {
-			return fmt.Sprintf("%s eq %d", col, int64(v))
+			return fmt.Sprintf("%s %s %d", col, odataOp, int64(v))
 		}
-		return fmt.Sprintf("%s eq %g", col, v)
+		return fmt.Sprintf("%s %s %g", col, odataOp, v)
 	case time.Time:
-		return fmt.Sprintf("%s eq datetime'%s'", col, v.UTC().Format("2006-01-02T15:04:05.0000000Z"))
+		return fmt.Sprintf("%s %s datetime'%s'", col, odataOp, v.UTC().Format("2006-01-02T15:04:05.0000000Z"))
 	case []byte:
-		return fmt.Sprintf("%s eq X'%x'", col, v)
+		return fmt.Sprintf("%s %s X'%x'", col, odataOp, v)
 	case nil:
-		return fmt.Sprintf("%s eq null", col)
+		return fmt.Sprintf("%s %s null", col, odataOp)
 	default:
-		return fmt.Sprintf("%s eq '%s'", col, strings.ReplaceAll(fmt.Sprintf("%v", v), "'", "''"))
+		return fmt.Sprintf("%s %s '%s'", col, odataOp, strings.ReplaceAll(fmt.Sprintf("%v", v), "'", "''"))
 	}
 }
 
