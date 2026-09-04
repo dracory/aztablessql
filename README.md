@@ -189,8 +189,32 @@ Both are available via `SELECT *` (included in the column set) and via explicit 
 - Joins, subqueries, `ORDER BY`, `LIMIT`, `TOP`, `GROUP BY`
 - `OR`, `LIKE`, `IS NULL`, `IN`
 - Bare numeric literals in `WHERE` (use a `?` placeholder or a quoted string literal instead)
-- Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`)
-- Batch operations
+- Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) — use the [Batch API](#batch-entity-group-transactions) for atomic multi-entity writes within a single partition
+
+## Batch / Entity Group Transactions
+
+Table Storage supports atomic batches of up to 100 operations **within a single partition** (entity-group transactions). `database/sql` has no native batch-exec concept, so this driver exposes a typed helper reached through `database/sql`'s `Conn.Raw` escape hatch — do the batch work inside the callback, since `Raw` forbids using the driver conn after the callback returns.
+
+```go
+conn, err := db.Conn(ctx)
+if err != nil { /* ... */ }
+defer conn.Close()
+
+ops := []aztablessql.BatchOp{
+    {Kind: aztablessql.BatchInsert, Partition: "pk", Row: "r1", Properties: map[string]interface{}{"Name": "Ada", "Age": int64(36)}},
+    {Kind: aztablessql.BatchInsert, Partition: "pk", Row: "r2", Properties: map[string]interface{}{"Name": "Bob"}},
+    {Kind: aztablessql.BatchDelete, Partition: "pk", Row: "r3"},
+}
+
+err = conn.Raw(func(driverConn any) error {
+    bc := driverConn.(*aztablessql.Conn).BatchClient("People")
+    return bc.SubmitBatch(ctx, ops)
+})
+```
+
+`BatchKind` values: `BatchInsert`, `BatchInsertMerge`, `BatchInsertReplace`, `BatchUpdateMerge`, `BatchUpdateReplace`, `BatchDelete`.
+
+Each op may carry an optional `ETag` (the special value `"*"` matches any existing ETag). The driver validates client-side that all ops share one `PartitionKey`, that there are at most 100 ops, and that no `RowKey` is targeted twice within a batch — a single failing op rolls back the entire batch atomically. The total payload size limit (~4 MiB per batch) is enforced by the service; oversized batches are rejected server-side.
 
 ## Type handling
 
