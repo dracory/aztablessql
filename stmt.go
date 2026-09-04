@@ -228,8 +228,6 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 	pk, hasPK := findKeyValue(conds, "PartitionKey")
 	rk, hasRK := findKeyValue(conds, "RowKey")
 
-	var entities [][]byte
-
 	// Point read: exactly PartitionKey + RowKey, both with "=" operator.
 	// A predicate like `WHERE PartitionKey = ? AND RowKey > ?` is a range
 	// scan and must go through ListEntities.
@@ -242,23 +240,30 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 			}
 			return nil, err
 		}
-		entities = append(entities, resp.Value)
-	} else {
-		opts := &aztables.ListEntitiesOptions{}
-		if filter := buildODataFilter(conds); filter != "" {
-			opts.Filter = &filter
-		}
-		pager := client.NewListEntitiesPager(opts)
-		for pager.More() {
-			resp, err := pager.NextPage(ctx)
-			if err != nil {
-				return nil, err
-			}
-			entities = append(entities, resp.Entities...)
-		}
+		return &Rows{columns: s.pq.columns, allCols: s.pq.allColumns, entities: [][]byte{resp.Value}}, nil
 	}
 
-	return &Rows{columns: s.pq.columns, allCols: s.pq.allColumns, entities: entities}, nil
+	// List path: fetch page 1 eagerly so Columns() can be answered before
+	// the first Next() call (database/sql contract), then continue lazily
+	// from page 2 onward. This avoids draining the entire result set into
+	// memory for large tables.
+	opts := &aztables.ListEntitiesOptions{}
+	if filter := buildODataFilter(conds); filter != "" {
+		opts.Filter = &filter
+	}
+	pager := client.NewListEntitiesPager(opts)
+	resp, err := pager.NextPage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &Rows{
+		columns: s.pq.columns,
+		allCols: s.pq.allColumns,
+		pager:   pager,
+		page:    resp.Entities,
+		pagePos: 0,
+		ctx:     ctx,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
