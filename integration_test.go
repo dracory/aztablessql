@@ -275,3 +275,154 @@ func TestIntegration_ContextCancellation(t *testing.T) {
 	// requests before observing cancellation. The test verifies the
 	// context is *threaded* (no panic, no type assertion error).
 }
+
+func TestIntegration_UpdateMergeSemantics(t *testing.T) {
+	table := uniqueTable("UpdMerge")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	// Insert initial entity with Name and Age.
+	_, err := db.Exec(
+		`INSERT INTO `+table+` (PartitionKey, RowKey, Name, Age) VALUES (?, ?, ?, ?)`,
+		"pk", "rk", "Ada Lovelace", 36,
+	)
+	if err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// UPDATE only the Age column — Name should be preserved by merge.
+	_, err = db.Exec(
+		`UPDATE `+table+` SET Age = ? WHERE PartitionKey = ? AND RowKey = ?`,
+		37, "pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+
+	// Read back and verify Name is unchanged, Age is updated.
+	rows, err := db.Query(
+		`SELECT * FROM `+table+` WHERE PartitionKey = ? AND RowKey = ?`,
+		"pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	defer rows.Close()
+
+	cols, _ := rows.Columns()
+	found := false
+	for rows.Next() {
+		found = true
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		m := make(map[string]interface{}, len(cols))
+		for i, c := range cols {
+			m[c] = vals[i]
+		}
+		if name, ok := m["Name"]; !ok || fmt.Sprintf("%v", name) != "Ada Lovelace" {
+			t.Errorf("Name = %v, want 'Ada Lovelace' (merge should preserve)", name)
+		}
+		if age, ok := m["Age"]; !ok || fmt.Sprintf("%v", age) != "37" {
+			t.Errorf("Age = %v, want 37", age)
+		}
+	}
+	if !found {
+		t.Fatal("expected 1 row after update, got 0")
+	}
+}
+
+func TestIntegration_UpdateSetLiteralValue(t *testing.T) {
+	table := uniqueTable("UpdLit")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	_, err := db.Exec(
+		`INSERT INTO `+table+` (PartitionKey, RowKey, Name) VALUES (?, ?, ?)`,
+		"pk", "rk", "Original",
+	)
+	if err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// UPDATE with a literal value in SET (not a placeholder).
+	_, err = db.Exec(
+		`UPDATE `+table+` SET Name = 'Updated' WHERE PartitionKey = ? AND RowKey = ?`,
+		"pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("UPDATE with literal: %v", err)
+	}
+
+	rows, err := db.Query(
+		`SELECT * FROM `+table+` WHERE PartitionKey = ? AND RowKey = ?`,
+		"pk", "rk",
+	)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	defer rows.Close()
+
+	cols, _ := rows.Columns()
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		m := make(map[string]interface{}, len(cols))
+		for i, c := range cols {
+			m[c] = vals[i]
+		}
+		if name, ok := m["Name"]; !ok || fmt.Sprintf("%v", name) != "Updated" {
+			t.Errorf("Name = %v, want 'Updated'", name)
+		}
+	}
+}
+
+func TestIntegration_UpdateRejectsSetKey(t *testing.T) {
+	table := uniqueTable("UpdKey")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	_, err := db.Exec(
+		`INSERT INTO `+table+` (PartitionKey, RowKey, Name) VALUES (?, ?, ?)`,
+		"pk", "rk", "Ada",
+	)
+	if err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// Attempting to SET PartitionKey must be rejected at parse time.
+	_, err = db.Exec(
+		`UPDATE `+table+` SET PartitionKey = ? WHERE PartitionKey = ? AND RowKey = ?`,
+		"newpk", "pk", "rk",
+	)
+	if err == nil {
+		t.Fatal("expected UPDATE SET PartitionKey to fail, got nil")
+	}
+	t.Logf("got expected error: %v", err)
+}
+
+func TestIntegration_UpdateRejectsMissingWhere(t *testing.T) {
+	table := uniqueTable("UpdNoWhere")
+	t.Cleanup(func() { dropTable(t, table) })
+	db := openDB(t, table)
+
+	_, err := db.Exec(
+		`UPDATE `+table+` SET Name = ?`,
+		"NewName",
+	)
+	if err == nil {
+		t.Fatal("expected UPDATE without WHERE to fail, got nil")
+	}
+	t.Logf("got expected error: %v", err)
+}

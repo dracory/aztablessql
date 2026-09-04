@@ -3,6 +3,7 @@ package aztablessql
 import (
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -134,4 +135,31 @@ func TestDriverRegistered(t *testing.T) {
 		}
 	}
 	t.Error("driver \"aztables\" is not registered with database/sql")
+}
+
+func TestWrapEDMType(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name     string
+		input    driver.Value
+		wantType string
+	}{
+		{"time.Time", now, "aztables.EDMDateTime"},
+		{"[]byte", []byte{0xAB, 0xCD}, "aztables.EDMBinary"},
+		{"int64", int64(42), "aztables.EDMInt64"},
+		{"string passthrough", "hello", "string"},
+		{"int passthrough", int(42), "int"},
+		{"bool passthrough", true, "bool"},
+		{"nil passthrough", nil, "<nil>"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := wrapEDMType(c.input)
+			gotType := fmt.Sprintf("%T", got)
+			if gotType != c.wantType {
+				t.Errorf("wrapEDMType(%T) type = %s, want %s", c.input, gotType, c.wantType)
+			}
+		})
+	}
 }

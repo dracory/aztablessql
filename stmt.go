@@ -18,7 +18,6 @@ var errTransactionsNotSupported = errors.New("aztablessql: transactions are not 
 type Stmt struct {
 	conn *Conn
 	pq   *parsedQuery
-	ctx  context.Context
 }
 
 func (s *Stmt) Close() error  { return nil }
@@ -29,7 +28,7 @@ func (s *Stmt) NumInput() int { return s.pq.numPlaceholders }
 // ---------------------------------------------------------------------------
 
 func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
-	return s.exec(s.ctx, args)
+	return s.exec(context.Background(), args)
 }
 
 // ExecContext implements driver.StmtExecContext.
@@ -41,6 +40,8 @@ func (s *Stmt) exec(ctx context.Context, args []driver.Value) (driver.Result, er
 	switch s.pq.kind {
 	case qInsert:
 		return s.execInsert(ctx, args)
+	case qUpdate:
+		return s.execUpdate(ctx, args)
 	case qDelete:
 		return s.execDelete(ctx, args)
 	default:
@@ -53,7 +54,7 @@ func (s *Stmt) exec(ctx context.Context, args []driver.Value) (driver.Result, er
 // ---------------------------------------------------------------------------
 
 func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
-	return s.query(s.ctx, args)
+	return s.query(context.Background(), args)
 }
 
 // QueryContext implements driver.StmtQueryContext.
@@ -89,7 +90,7 @@ func (s *Stmt) execInsert(ctx context.Context, args []driver.Value) (driver.Resu
 			entity.RowKey = fmt.Sprintf("%v", args[i])
 			hasRK = true
 		default:
-			entity.Properties[col] = args[i]
+			entity.Properties[col] = wrapEDMType(args[i])
 		}
 	}
 	if !hasPK || !hasRK {
@@ -101,6 +102,55 @@ func (s *Stmt) execInsert(ctx context.Context, args []driver.Value) (driver.Resu
 		return nil, err
 	}
 	if _, err := client.AddEntity(ctx, b, nil); err != nil {
+		return nil, err
+	}
+	return driverResult{rowsAffected: 1}, nil
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE (merge semantics — only SET columns are touched)
+// ---------------------------------------------------------------------------
+
+func (s *Stmt) execUpdate(ctx context.Context, args []driver.Value) (driver.Result, error) {
+	if len(args) != s.pq.numPlaceholders {
+		return nil, fmt.Errorf("aztablessql: expected %d args, got %d", s.pq.numPlaceholders, len(args))
+	}
+	setArgs := args[:s.pq.setPlaceholders]
+	whereArgs := args[s.pq.setPlaceholders:]
+
+	conds, err := resolveWhere(s.pq.where, whereArgs)
+	if err != nil {
+		return nil, err
+	}
+	pk, ok1 := findKeyValue(conds, "PartitionKey")
+	rk, ok2 := findKeyValue(conds, "RowKey")
+	if !ok1 || !ok2 {
+		return nil, errors.New("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ?")
+	}
+
+	entity := aztables.EDMEntity{Properties: map[string]interface{}{}}
+	entity.PartitionKey = pk
+	entity.RowKey = rk
+
+	argIdx := 0
+	for _, a := range s.pq.set {
+		if a.isPlaceholder {
+			entity.Properties[a.column] = wrapEDMType(setArgs[argIdx])
+			argIdx++
+		} else {
+			entity.Properties[a.column] = a.value
+		}
+	}
+
+	b, err := json.Marshal(entity)
+	if err != nil {
+		return nil, err
+	}
+
+	client := s.conn.svc.NewClient(s.pq.table)
+	if _, err := client.UpdateEntity(ctx, b, &aztables.UpdateEntityOptions{
+		UpdateMode: aztables.UpdateModeMerge,
+	}); err != nil {
 		return nil, err
 	}
 	return driverResult{rowsAffected: 1}, nil
@@ -281,6 +331,23 @@ func formatODataPredicate(col string, val driver.Value) string {
 }
 
 // ---------------------------------------------------------------------------
+
+// wrapEDMType converts Go native types into their aztables EDM equivalents
+// so that the SDK serializes them with the correct Edm type annotations.
+// time.Time becomes EDMDateTime, []byte becomes EDMBinary, int64 becomes
+// EDMInt64. All other types pass through unchanged.
+func wrapEDMType(v driver.Value) interface{} {
+	switch v := v.(type) {
+	case time.Time:
+		return aztables.EDMDateTime(v)
+	case []byte:
+		return aztables.EDMBinary(v)
+	case int64:
+		return aztables.EDMInt64(v)
+	default:
+		return v
+	}
+}
 
 func isNotFound(err error) bool {
 	var respErr *azcore.ResponseError

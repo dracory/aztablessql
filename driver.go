@@ -34,14 +34,15 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 	return c.PrepareContext(context.Background(), query)
 }
 
-// PrepareContext implements driver.ConnPrepareContext so the caller's context
-// is threaded through to every subsequent Exec/Query call.
+// PrepareContext implements driver.ConnPrepareContext.
+// The context is used only for the preparation step; per-call contexts are
+// threaded through ExecContext/QueryContext at execution time.
 func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	pq, err := parseQuery(query)
 	if err != nil {
 		return nil, err
 	}
-	return &Stmt{conn: c, pq: pq, ctx: ctx}, nil
+	return &Stmt{conn: c, pq: pq}, nil
 }
 
 func (c *Conn) Close() error { return nil }
