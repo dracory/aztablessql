@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"errors"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 )
@@ -15,7 +14,8 @@ func init() {
 
 // Driver implements database/sql/driver.Driver.
 // DSN is an Azure Storage connection string, e.g.
-//   "DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
+//
+//	"DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
 type Driver struct{}
 
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
@@ -23,24 +23,29 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Conn{svc: svc, ctx: context.Background()}, nil
+	return &Conn{svc: svc}, nil
 }
 
 type Conn struct {
 	svc *aztables.ServiceClient
-	ctx context.Context
 }
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
+	return c.PrepareContext(context.Background(), query)
+}
+
+// PrepareContext implements driver.ConnPrepareContext so the caller's context
+// is threaded through to every subsequent Exec/Query call.
+func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	pq, err := parseQuery(query)
 	if err != nil {
 		return nil, err
 	}
-	return &Stmt{conn: c, pq: pq}, nil
+	return &Stmt{conn: c, pq: pq, ctx: ctx}, nil
 }
 
 func (c *Conn) Close() error { return nil }
 
 func (c *Conn) Begin() (driver.Tx, error) {
-	return nil, errors.New("aztablessql: transactions are not supported")
+	return nil, errTransactionsNotSupported
 }

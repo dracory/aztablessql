@@ -15,6 +15,12 @@ type Rows struct {
 	resolvedCols []string
 }
 
+// Columns returns the column names for the result set.
+//
+// For explicit column lists (SELECT a, b) the original list is returned.
+// For SELECT * the column set is merged across ALL entities, because Azure
+// Table Storage allows heterogeneous entities within the same table —
+// different rows may have different properties.
 func (r *Rows) Columns() []string {
 	if !r.allCols {
 		return r.columns
@@ -22,19 +28,20 @@ func (r *Rows) Columns() []string {
 	if r.resolvedCols != nil {
 		return r.resolvedCols
 	}
-	if len(r.entities) == 0 {
-		return []string{}
-	}
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(r.entities[0], &m); err != nil {
-		return []string{}
-	}
-	cols := make([]string, 0, len(m))
-	for k := range m {
-		if k == "odata.etag" {
+	seen := map[string]bool{}
+	var cols []string
+	for _, entity := range r.entities {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(entity, &m); err != nil {
 			continue
 		}
-		cols = append(cols, k)
+		for k := range m {
+			if k == "odata.etag" || seen[k] {
+				continue
+			}
+			seen[k] = true
+			cols = append(cols, k)
+		}
 	}
 	sort.Strings(cols)
 	r.resolvedCols = cols
@@ -53,6 +60,9 @@ func (r *Rows) Next(dest []driver.Value) error {
 	}
 	cols := r.Columns()
 	for i, c := range cols {
+		if i >= len(dest) {
+			break
+		}
 		dest[i] = m[c]
 	}
 	r.pos++
