@@ -3,10 +3,13 @@ package aztablessql
 import (
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 )
 
 func TestNormalizeKeyName(t *testing.T) {
@@ -277,6 +280,256 @@ func TestWrapEDMType(t *testing.T) {
 			gotType := fmt.Sprintf("%T", got)
 			if gotType != c.wantType {
 				t.Errorf("wrapEDMType(%T) type = %s, want %s", c.input, gotType, c.wantType)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ETag helpers (Tier 1, item 3)
+// ---------------------------------------------------------------------------
+
+func TestFindETagValue(t *testing.T) {
+	cases := []struct {
+		name   string
+		conds  []resolvedCond
+		want   string
+		wantOK bool
+	}{
+		{
+			name:   "no etag",
+			conds:  []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}},
+			wantOK: false,
+		},
+		{
+			name:   "etag placeholder value",
+			conds:  []resolvedCond{{column: "ETag", op: "=", value: `W/"0xABC"`}},
+			want:   `W/"0xABC"`,
+			wantOK: true,
+		},
+		{
+			name:   "etag lowercase",
+			conds:  []resolvedCond{{column: "etag", op: "=", value: `W/"0xDEF"`}},
+			want:   `W/"0xDEF"`,
+			wantOK: true,
+		},
+		{
+			name:   "etag star",
+			conds:  []resolvedCond{{column: "ETag", op: "=", value: "*"}},
+			want:   "*",
+			wantOK: true,
+		},
+		{
+			name:   "etag non-eq ignored",
+			conds:  []resolvedCond{{column: "ETag", op: ">", value: "x"}},
+			wantOK: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := findETagValue(c.conds)
+			if ok != c.wantOK {
+				t.Fatalf("findETagValue ok = %v, want %v", ok, c.wantOK)
+			}
+			if ok && got != c.want {
+				t.Errorf("findETagValue = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestETagPtr(t *testing.T) {
+	// Regular ETag value.
+	p := etagPtr(`W/"0xABC"`)
+	if p == nil {
+		t.Fatal("etagPtr returned nil")
+	}
+	if string(*p) != `W/"0xABC"` {
+		t.Errorf("etagPtr value = %q, want %q", string(*p), `W/"0xABC"`)
+	}
+
+	// "*" maps to azcore.ETagAny.
+	pStar := etagPtr("*")
+	if string(*pStar) != string(azcore.ETagAny) {
+		t.Errorf("etagPtr('*') = %q, want %q", string(*pStar), string(azcore.ETagAny))
+	}
+}
+
+func TestWrapPreconditionFailed(t *testing.T) {
+	if err := wrapPreconditionFailed(nil); err != nil {
+		t.Errorf("wrapPreconditionFailed(nil) = %v, want nil", err)
+	}
+
+	// Non-412 error passes through unchanged.
+	passErr := errors.New("some other error")
+	if got := wrapPreconditionFailed(passErr); got != passErr {
+		t.Errorf("wrapPreconditionFailed(non-412) returned a different error: %v", got)
+	}
+}
+
+// TestWrapPreconditionFailed412 verifies that a 412 *azcore.ResponseError is
+// wrapped with the "aztablessql: ETag precondition failed" prefix and that
+// the original error is preserved via %w so errors.As still works.
+func TestWrapPreconditionFailed412(t *testing.T) {
+	orig := &azcore.ResponseError{StatusCode: 412, ErrorCode: "UpdateConditionNotSatisfied"}
+	got := wrapPreconditionFailed(orig)
+
+	if got == nil {
+		t.Fatal("wrapPreconditionFailed(412) returned nil, want wrapped error")
+	}
+	if !strings.Contains(got.Error(), "aztablessql: ETag precondition failed") {
+		t.Errorf("error = %q, want it to contain 'aztablessql: ETag precondition failed'", got.Error())
+	}
+	if !strings.Contains(got.Error(), "UpdateConditionNotSatisfied") {
+		t.Errorf("error = %q, want it to preserve the original ErrorCode", got.Error())
+	}
+
+	// errors.As must still find the original *azcore.ResponseError.
+	var respErr *azcore.ResponseError
+	if !errors.As(got, &respErr) {
+		t.Errorf("errors.As failed to find *azcore.ResponseError in wrapped error: %v", got)
+	}
+	if respErr.StatusCode != 412 {
+		t.Errorf("unwrapped StatusCode = %d, want 412", respErr.StatusCode)
+	}
+}
+
+// TestWrapPreconditionFailedNon412ResponseError verifies that a non-412
+// *azcore.ResponseError (e.g. 404) passes through unwrapped.
+func TestWrapPreconditionFailedNon412ResponseError(t *testing.T) {
+	orig := &azcore.ResponseError{StatusCode: 404, ErrorCode: "ResourceNotFound"}
+	got := wrapPreconditionFailed(orig)
+	if got != orig {
+		t.Errorf("wrapPreconditionFailed(404) wrapped the error, want pass-through: got %v", got)
+	}
+}
+
+func TestBuildInsertEntityRejectsETagAndTimestamp(t *testing.T) {
+	cases := []struct {
+		name    string
+		columns []string
+		args    []driver.Value
+		wantErr string
+	}{
+		{
+			name:    "insert etag",
+			columns: []string{"PartitionKey", "RowKey", "ETag"},
+			args:    []driver.Value{"pk", "rk", `W/"0x"`},
+			wantErr: "read-only pseudo-column",
+		},
+		{
+			name:    "insert timestamp",
+			columns: []string{"PartitionKey", "RowKey", "Timestamp"},
+			args:    []driver.Value{"pk", "rk", "2026-01-01T00:00:00Z"},
+			wantErr: "read-only pseudo-column",
+		},
+		{
+			name:    "insert lowercase etag",
+			columns: []string{"PartitionKey", "RowKey", "etag"},
+			args:    []driver.Value{"pk", "rk", `W/"0x"`},
+			wantErr: "read-only pseudo-column",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := buildInsertEntity(c.columns, c.args)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), c.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidatePointConds verifies the execution-time defensive backstop for
+// UPDATE/DELETE: exactly PartitionKey = ? AND RowKey = ?, optionally
+// AND ETag = ?. Extra conditions, non-"=" operators, and unknown columns
+// are rejected.
+func TestValidatePointConds(t *testing.T) {
+	cases := []struct {
+		name       string
+		conds      []resolvedCond
+		wantErr    bool
+		wantErrSub string
+		wantPK     string
+		wantRK     string
+		wantETag   string
+	}{
+		{
+			name:   "pk rk only",
+			conds:  []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}, {column: "RowKey", op: "=", value: "rk"}},
+			wantPK: "pk",
+			wantRK: "rk",
+		},
+		{
+			name:     "pk rk etag",
+			conds:    []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}, {column: "RowKey", op: "=", value: "rk"}, {column: "ETag", op: "=", value: `W/"0x"`}},
+			wantPK:   "pk",
+			wantRK:   "rk",
+			wantETag: `W/"0x"`,
+		},
+		{
+			name:       "too few conds",
+			conds:      []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}},
+			wantErr:    true,
+			wantErrSub: "requires WHERE PartitionKey",
+		},
+		{
+			name:       "too many conds",
+			conds:      []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}, {column: "RowKey", op: "=", value: "rk"}, {column: "ETag", op: "=", value: "x"}, {column: "Extra", op: "=", value: "y"}},
+			wantErr:    true,
+			wantErrSub: "optionally AND ETag",
+		},
+		{
+			name:       "unknown column",
+			conds:      []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}, {column: "RowKey", op: "=", value: "rk"}, {column: "Age", op: "=", value: "30"}},
+			wantErr:    true,
+			wantErrSub: "only supports PartitionKey, RowKey and ETag",
+		},
+		{
+			name:       "non-eq on pk",
+			conds:      []resolvedCond{{column: "PartitionKey", op: ">", value: "pk"}, {column: "RowKey", op: "=", value: "rk"}},
+			wantErr:    true,
+			wantErrSub: "only supports = on PartitionKey",
+		},
+		{
+			name:       "non-eq on etag",
+			conds:      []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}, {column: "RowKey", op: "=", value: "rk"}, {column: "ETag", op: ">", value: "x"}},
+			wantErr:    true,
+			wantErrSub: "ETag condition only supports =",
+		},
+		{
+			name:       "duplicate etag (4 conds rejected by length check first)",
+			conds:      []resolvedCond{{column: "PartitionKey", op: "=", value: "pk"}, {column: "RowKey", op: "=", value: "rk"}, {column: "ETag", op: "=", value: "x"}, {column: "ETag", op: "=", value: "y"}},
+			wantErr:    true,
+			wantErrSub: "optionally AND ETag",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pk, rk, etag, err := validatePointConds(c.conds, "UPDATE")
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if c.wantErrSub != "" && !strings.Contains(err.Error(), c.wantErrSub) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), c.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if pk != c.wantPK {
+				t.Errorf("pk = %q, want %q", pk, c.wantPK)
+			}
+			if rk != c.wantRK {
+				t.Errorf("rk = %q, want %q", rk, c.wantRK)
+			}
+			if etag != c.wantETag {
+				t.Errorf("etag = %q, want %q", etag, c.wantETag)
 			}
 		})
 	}

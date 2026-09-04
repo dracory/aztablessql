@@ -115,8 +115,8 @@ func main() {
 | **INSERT OR MERGE** | `INSERT OR MERGE INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Upsert with merge semantics — if the entity exists, only the supplied properties are updated; existing properties are preserved. Maps to `UpsertEntity` with `UpdateModeMerge`. |
 | **UPSERT INTO** | `UPSERT INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Alias for `INSERT OR REPLACE`. |
 | **SELECT** | `SELECT * FROM <table> [WHERE ...]` or `SELECT col1, col2 FROM <table> [WHERE ...]` | Point read when `WHERE PartitionKey = ? AND RowKey = ?` (uses `GetEntity`). Otherwise falls back to `ListEntities` with an OData filter. |
-| **UPDATE** | `UPDATE <table> SET col1 = ?, col2 = ? WHERE PartitionKey = ? AND RowKey = ?` | Merge semantics — only SET columns are touched, existing properties are preserved. `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`. Cannot SET `PartitionKey` or `RowKey`. |
-| **DELETE** | `DELETE FROM <table> WHERE PartitionKey = ? AND RowKey = ?` | `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`. Extra conditions are rejected. |
+| **UPDATE** | `UPDATE <table> SET col1 = ?, col2 = ? WHERE PartitionKey = ? AND RowKey = ? [AND ETag = ?]` | Merge semantics — only SET columns are touched, existing properties are preserved. `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`, optionally followed by `AND ETag = ?` for optimistic concurrency. Cannot SET `PartitionKey`, `RowKey`, `ETag`, or `Timestamp`. |
+| **DELETE** | `DELETE FROM <table> WHERE PartitionKey = ? AND RowKey = ? [AND ETag = ?]` | `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`, optionally followed by `AND ETag = ?` for optimistic concurrency. Extra conditions are rejected. |
 
 ### Upsert
 
@@ -148,7 +148,41 @@ SELECT * FROM People WHERE Name != 'Bob'
 
 #### UPDATE / DELETE WHERE
 
-`UPDATE` and `DELETE` are **point operations only**. Their `WHERE` clause must be exactly `PartitionKey = ? AND RowKey = ?` (literals also accepted), and both operators must be `=`. Non-`=` operators on the key columns are rejected at parse time, as are any extra conditions. This is intentional: Table Storage has no conditional range delete, and accepting a non-`=` predicate would silently delete/update the wrong single entity.
+`UPDATE` and `DELETE` are **point operations only**. Their `WHERE` clause must be exactly `PartitionKey = ? AND RowKey = ?` (literals also accepted), and both operators must be `=`. Non-`=` operators on the key columns are rejected at parse time, as are any extra conditions (other than the optional `AND ETag = ?` described below). This is intentional: Table Storage has no conditional range delete, and accepting a non-`=` predicate would silently delete/update the wrong single entity.
+
+### Optimistic concurrency (ETag)
+
+Every entity has a server-managed `ETag` that changes on each write. `UPDATE` and `DELETE` accept an optional `AND ETag = ?` condition in the `WHERE` clause, mapped to the Table Storage `If-Match` header. This enables optimistic concurrency: the operation succeeds only if the entity's current ETag matches the supplied value, preventing lost updates when multiple writers race.
+
+```sql
+-- Read the entity to obtain its ETag
+SELECT * FROM People WHERE PartitionKey = ? AND RowKey = ?
+
+-- Update only if the entity has not been modified since
+UPDATE People SET Age = ? WHERE PartitionKey = ? AND RowKey = ? AND ETag = ?
+```
+
+- The ETag value is the opaque string returned by Table Storage (e.g. `W/"datetime'...'"`).
+- `ETag = '*'` matches any existing entity — the operation fails (404) if the entity does not exist.
+- A mismatched ETag produces a `412 Precondition Failed` error, wrapped with a clearer `aztablessql: ETag precondition failed` message. The original SDK error is preserved via `%w` so `errors.Is`/`errors.As` still work.
+- Only one `ETag` condition is allowed; the operator must be `=`.
+- `ETag` is not accepted in `INSERT`/`UPSERT` column lists or in `SET` clauses — it is server-managed.
+
+### Pseudo-columns
+
+`ETag` and `Timestamp` are **reserved** server-managed pseudo-columns surfaced in `SELECT` results:
+
+- **`ETag`** — the entity's OData ETag (from the `odata.etag` JSON field). Changes on every write.
+- **`Timestamp`** — the entity's last-modified time (ISO-8601 string). Server-managed.
+
+Both are available via `SELECT *` (included in the column set) and via explicit selection (`SELECT ETag, Timestamp FROM ...`). They are read-only:
+
+- Rejected in `INSERT`/`UPSERT` column lists and `UPDATE` `SET` clauses (they are server-managed).
+- Rejected in `SELECT` `WHERE` filters — they are not stored, OData-queryable properties, so a filter like `WHERE ETag = ?` would be rejected by the Table Storage service.
+
+`Timestamp` is returned as a `string` for consistency with the JSON-decode-as-is policy; callers can parse it to `time.Time` if needed.
+
+> **Reserved names:** Because `ETag` and `Timestamp` are intercepted by the driver and mapped to entity meta fields, you cannot use them as ordinary property names. If your entity has a stored property that happens to be named `ETag` or `Timestamp`, the driver will surface the server-managed meta-field value instead of the stored property value in `SELECT` results. Avoid using these names for your own properties.
 
 ### What's NOT supported
 
@@ -156,7 +190,6 @@ SELECT * FROM People WHERE Name != 'Bob'
 - `OR`, `LIKE`, `IS NULL`, `IN`
 - Bare numeric literals in `WHERE` (use a `?` placeholder or a quoted string literal instead)
 - Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`)
-- Optimistic concurrency (ETag / `If-Match`)
 - Batch operations
 
 ## Type handling

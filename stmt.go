@@ -126,6 +126,8 @@ func buildInsertEntity(columns []string, args []driver.Value) (aztables.EDMEntit
 		case "rowkey":
 			entity.RowKey = fmt.Sprintf("%v", args[i])
 			hasRK = true
+		case "etag", "timestamp":
+			return entity, fmt.Errorf("aztablessql: cannot INSERT read-only pseudo-column %q (ETag/Timestamp are server-managed)", col)
 		default:
 			entity.Properties[col] = wrapEDMType(args[i])
 		}
@@ -151,10 +153,9 @@ func (s *Stmt) execUpdate(ctx context.Context, args []driver.Value) (driver.Resu
 	if err != nil {
 		return nil, err
 	}
-	pk, ok1 := findKeyValue(conds, "PartitionKey")
-	rk, ok2 := findKeyValue(conds, "RowKey")
-	if !ok1 || !ok2 {
-		return nil, errors.New("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ?")
+	pk, rk, etag, err := validatePointConds(conds, "UPDATE")
+	if err != nil {
+		return nil, err
 	}
 
 	entity := aztables.EDMEntity{Properties: map[string]interface{}{}}
@@ -176,11 +177,14 @@ func (s *Stmt) execUpdate(ctx context.Context, args []driver.Value) (driver.Resu
 		return nil, err
 	}
 
+	opts := &aztables.UpdateEntityOptions{UpdateMode: aztables.UpdateModeMerge}
+	if etag != "" {
+		opts.IfMatch = etagPtr(etag)
+	}
+
 	client := s.conn.svc.NewClient(s.pq.table)
-	if _, err := client.UpdateEntity(ctx, b, &aztables.UpdateEntityOptions{
-		UpdateMode: aztables.UpdateModeMerge,
-	}); err != nil {
-		return nil, err
+	if _, err := client.UpdateEntity(ctx, b, opts); err != nil {
+		return nil, wrapPreconditionFailed(err)
 	}
 	return driverResult{rowsAffected: 1}, nil
 }
@@ -195,21 +199,22 @@ func (s *Stmt) execDelete(ctx context.Context, args []driver.Value) (driver.Resu
 		return nil, err
 	}
 	// DELETE only supports a point delete on PartitionKey + RowKey, both
-	// with "=". The parser enforces this via validateDeleteWhere; this is a
-	// defensive backstop in case a parsedQuery is constructed by other means.
-	if len(conds) != 2 ||
-		findKeyOp(conds, "PartitionKey") != "=" ||
-		findKeyOp(conds, "RowKey") != "=" {
-		return nil, errors.New("aztablessql: DELETE requires WHERE PartitionKey = ? AND RowKey = ? (point delete only)")
-	}
-	pk, ok1 := findKeyValue(conds, "PartitionKey")
-	rk, ok2 := findKeyValue(conds, "RowKey")
-	if !ok1 || !ok2 {
-		return nil, errors.New("aztablessql: DELETE requires WHERE PartitionKey = ? AND RowKey = ?")
-	}
-	client := s.conn.svc.NewClient(s.pq.table)
-	if _, err := client.DeleteEntity(ctx, pk, rk, nil); err != nil {
+	// with "=", plus an optional ETag = ? condition. The parser enforces
+	// this via validateDeleteWhere; this is a defensive backstop in case a
+	// parsedQuery is constructed by other means.
+	pk, rk, etag, err := validatePointConds(conds, "DELETE")
+	if err != nil {
 		return nil, err
+	}
+
+	opts := &aztables.DeleteEntityOptions{}
+	if etag != "" {
+		opts.IfMatch = etagPtr(etag)
+	}
+
+	client := s.conn.svc.NewClient(s.pq.table)
+	if _, err := client.DeleteEntity(ctx, pk, rk, opts); err != nil {
+		return nil, wrapPreconditionFailed(err)
 	}
 	return driverResult{rowsAffected: 1}, nil
 }
@@ -319,6 +324,97 @@ func findKeyOp(conds []resolvedCond, key string) string {
 		}
 	}
 	return ""
+}
+
+// findETagValue performs a case-insensitive search for an ETag condition
+// (op "=") and returns its string representation. The ETag value is a
+// server-returned opaque string (e.g. W/"0x..."). The special value "*"
+// means "match any existing entity".
+func findETagValue(conds []resolvedCond) (string, bool) {
+	for _, c := range conds {
+		if strings.EqualFold(c.column, "ETag") && c.op == "=" {
+			return fmt.Sprintf("%v", c.value), true
+		}
+	}
+	return "", false
+}
+
+// validatePointConds is the execution-time defensive backstop for UPDATE and
+// DELETE. It mirrors the parser-level validateUpdateWhere / validateDeleteWhere
+// rules: exactly PartitionKey = ? AND RowKey = ?, optionally AND ETag = ?.
+// It returns the partition key, row key, ETag (empty if absent), and an error
+// if the conditions are not a valid point operation. label ("UPDATE"/"DELETE")
+// is used in error messages.
+//
+// This exists in addition to the parser validation so that a parsedQuery
+// constructed by other means (e.g. a future code path) cannot silently ignore
+// extra conditions or slip a non-"=" operator through.
+func validatePointConds(conds []resolvedCond, label string) (pk, rk, etag string, err error) {
+	if len(conds) != 2 && len(conds) != 3 {
+		return "", "", "", fmt.Errorf("aztablessql: %s requires WHERE PartitionKey = ? AND RowKey = ? (optionally AND ETag = ?)", label)
+	}
+	var hasPK, hasRK, hasETag bool
+	for _, c := range conds {
+		switch strings.ToLower(c.column) {
+		case "partitionkey":
+			if c.op != "=" {
+				return "", "", "", fmt.Errorf("aztablessql: %s WHERE only supports = on PartitionKey, got %q", label, c.op)
+			}
+			if hasPK {
+				return "", "", "", fmt.Errorf("aztablessql: %s WHERE has duplicate PartitionKey", label)
+			}
+			pk = fmt.Sprintf("%v", c.value)
+			hasPK = true
+		case "rowkey":
+			if c.op != "=" {
+				return "", "", "", fmt.Errorf("aztablessql: %s WHERE only supports = on RowKey, got %q", label, c.op)
+			}
+			if hasRK {
+				return "", "", "", fmt.Errorf("aztablessql: %s WHERE has duplicate RowKey", label)
+			}
+			rk = fmt.Sprintf("%v", c.value)
+			hasRK = true
+		case "etag":
+			if c.op != "=" {
+				return "", "", "", fmt.Errorf("aztablessql: ETag condition only supports =, got %q", c.op)
+			}
+			if hasETag {
+				return "", "", "", fmt.Errorf("aztablessql: only one ETag condition is allowed")
+			}
+			etag = fmt.Sprintf("%v", c.value)
+			hasETag = true
+		default:
+			return "", "", "", fmt.Errorf("aztablessql: %s WHERE only supports PartitionKey, RowKey and ETag, got %q", label, c.column)
+		}
+	}
+	if !hasPK || !hasRK {
+		return "", "", "", fmt.Errorf("aztablessql: %s requires WHERE PartitionKey = ? AND RowKey = ?", label)
+	}
+	return pk, rk, etag, nil
+}
+
+// etagPtr converts an ETag string into the *azcore.ETag expected by the SDK
+// options. The "*" value maps to azcore.ETagAny.
+func etagPtr(etag string) *azcore.ETag {
+	e := azcore.ETag(etag)
+	if etag == "*" {
+		e = azcore.ETagAny
+	}
+	return &e
+}
+
+// wrapPreconditionFailed detects a 412 Precondition Failed response from the
+// SDK and wraps it with a clearer message. The original error is preserved
+// via %w so errors.Is/errors.As still work.
+func wrapPreconditionFailed(err error) error {
+	if err == nil {
+		return nil
+	}
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) && respErr.StatusCode == 412 {
+		return fmt.Errorf("aztablessql: ETag precondition failed (entity was modified by another writer): %w", err)
+	}
+	return err
 }
 
 // ---------------------------------------------------------------------------

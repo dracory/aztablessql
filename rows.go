@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
@@ -82,7 +83,15 @@ func (r *Rows) collectCols(entity []byte, seen map[string]bool, cols *[]string) 
 		return
 	}
 	for k := range m {
-		if k == "odata.etag" || seen[k] {
+		if k == "odata.etag" {
+			// Surface the ETag as a synthetic pseudo-column named "ETag".
+			if !seen["ETag"] {
+				seen["ETag"] = true
+				*cols = append(*cols, "ETag")
+			}
+			continue
+		}
+		if seen[k] {
 			continue
 		}
 		seen[k] = true
@@ -154,7 +163,38 @@ func (r *Rows) decodeEntity(entity []byte, dest []driver.Value) error {
 		return fmt.Errorf("aztablessql: destination slice too short: got %d, want %d", len(dest), len(cols))
 	}
 	for i, c := range cols {
-		dest[i] = m[c]
+		dest[i] = resolveColumnValue(c, m)
 	}
 	return nil
+}
+
+// resolveColumnValue looks up a column value from the decoded entity map.
+// Pseudo-columns ETag and Timestamp are resolved from the entity's JSON meta
+// fields rather than the regular properties map:
+//   - ETag     ← "odata.etag" (the OData ETag annotation)
+//   - Timestamp ← "Timestamp" (case-insensitive; the server-managed field)
+//
+// All other column names are looked up directly in the map (case-sensitive,
+// matching Azure Table Storage's case-sensitive property-name semantics).
+//
+// The Timestamp fallback checks a fixed set of common casings deterministically
+// (no map iteration) so the result is stable regardless of Go map iteration
+// order.
+func resolveColumnValue(col string, m map[string]interface{}) interface{} {
+	if strings.EqualFold(col, "ETag") {
+		return m["odata.etag"]
+	}
+	if strings.EqualFold(col, "Timestamp") {
+		// Deterministic case-insensitive lookup. Azure Table Storage and
+		// Azurite both use "Timestamp", but we check a few common casings
+		// in priority order rather than iterating the map (which would be
+		// non-deterministic if multiple casings were present).
+		for _, k := range []string{"Timestamp", "timestamp", "TIMESTAMP"} {
+			if v, ok := m[k]; ok {
+				return v
+			}
+		}
+		return nil
+	}
+	return m[col]
 }

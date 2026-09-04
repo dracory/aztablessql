@@ -122,6 +122,9 @@ func parseQuery(query string) (*parsedQuery, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := validateSelectWhere(conds); err != nil {
+			return nil, err
+		}
 		pq := &parsedQuery{kind: qSelect, table: table, where: conds, numPlaceholders: n}
 		if colsStr == "*" {
 			pq.allColumns = true
@@ -215,6 +218,9 @@ func parseSet(setStr string) ([]setAssign, int, error) {
 		if strings.EqualFold(col, "PartitionKey") || strings.EqualFold(col, "RowKey") {
 			return nil, 0, fmt.Errorf("aztablessql: cannot SET PartitionKey/RowKey")
 		}
+		if strings.EqualFold(col, "ETag") || strings.EqualFold(col, "Timestamp") {
+			return nil, 0, fmt.Errorf("aztablessql: cannot SET read-only pseudo-column %q (ETag/Timestamp are server-managed)", col)
+		}
 		if tok == "?" {
 			assigns = append(assigns, setAssign{column: col, isPlaceholder: true})
 			n++
@@ -228,44 +234,95 @@ func parseSet(setStr string) ([]setAssign, int, error) {
 	return assigns, n, nil
 }
 
+// validateUpdateWhere enforces that UPDATE stays a point update on
+// PartitionKey + RowKey (both with "="), with an optional ETag = ? condition
+// for optimistic concurrency. The ETag condition is mapped to If-Match at
+// execution time, not included in the OData filter.
 func validateUpdateWhere(conds []whereCond) error {
-	var hasPK, hasRK bool
+	var hasPK, hasRK, hasETag bool
 	for _, c := range conds {
-		if c.op != "=" {
-			return fmt.Errorf("aztablessql: UPDATE WHERE only supports =, got %q for %q", c.op, c.column)
-		}
 		switch strings.ToLower(c.column) {
 		case "partitionkey":
+			if c.op != "=" {
+				return fmt.Errorf("aztablessql: UPDATE WHERE only supports =, got %q for %q", c.op, c.column)
+			}
 			hasPK = true
 		case "rowkey":
+			if c.op != "=" {
+				return fmt.Errorf("aztablessql: UPDATE WHERE only supports =, got %q for %q", c.op, c.column)
+			}
 			hasRK = true
+		case "etag":
+			if c.op != "=" {
+				return fmt.Errorf("aztablessql: ETag condition only supports =, got %q", c.op)
+			}
+			if hasETag {
+				return fmt.Errorf("aztablessql: only one ETag condition is allowed")
+			}
+			hasETag = true
+		default:
+			return fmt.Errorf("aztablessql: UPDATE WHERE only supports PartitionKey, RowKey and ETag, got %q", c.column)
 		}
 	}
-	if !hasPK || !hasRK || len(conds) != 2 {
-		return fmt.Errorf("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ? (exactly)")
+	if !hasPK || !hasRK {
+		return fmt.Errorf("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ?")
+	}
+	if len(conds) != 2 && len(conds) != 3 {
+		return fmt.Errorf("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ? (optionally AND ETag = ?)")
 	}
 	return nil
 }
 
 // validateDeleteWhere enforces that DELETE stays a point delete: exactly
-// PartitionKey = ? AND RowKey = ?, both with the "=" operator. Without this
+// PartitionKey = ? AND RowKey = ?, both with the "=" operator, with an
+// optional ETag = ? condition for optimistic concurrency. Without this
 // check, a predicate like `WHERE PartitionKey = 'p' AND RowKey > 'r'` would
 // parse, resolve RowKey to "r", and silently delete the wrong entity.
 func validateDeleteWhere(conds []whereCond) error {
-	var hasPK, hasRK bool
+	var hasPK, hasRK, hasETag bool
 	for _, c := range conds {
-		if c.op != "=" {
-			return fmt.Errorf("aztablessql: DELETE WHERE only supports =, got %q for %q", c.op, c.column)
-		}
 		switch strings.ToLower(c.column) {
 		case "partitionkey":
+			if c.op != "=" {
+				return fmt.Errorf("aztablessql: DELETE WHERE only supports =, got %q for %q", c.op, c.column)
+			}
 			hasPK = true
 		case "rowkey":
+			if c.op != "=" {
+				return fmt.Errorf("aztablessql: DELETE WHERE only supports =, got %q for %q", c.op, c.column)
+			}
 			hasRK = true
+		case "etag":
+			if c.op != "=" {
+				return fmt.Errorf("aztablessql: ETag condition only supports =, got %q", c.op)
+			}
+			if hasETag {
+				return fmt.Errorf("aztablessql: only one ETag condition is allowed")
+			}
+			hasETag = true
+		default:
+			return fmt.Errorf("aztablessql: DELETE WHERE only supports PartitionKey, RowKey and ETag, got %q", c.column)
 		}
 	}
-	if !hasPK || !hasRK || len(conds) != 2 {
-		return fmt.Errorf("aztablessql: DELETE requires WHERE PartitionKey = ? AND RowKey = ? (exactly)")
+	if !hasPK || !hasRK {
+		return fmt.Errorf("aztablessql: DELETE requires WHERE PartitionKey = ? AND RowKey = ?")
+	}
+	if len(conds) != 2 && len(conds) != 3 {
+		return fmt.Errorf("aztablessql: DELETE requires WHERE PartitionKey = ? AND RowKey = ? (optionally AND ETag = ?)")
+	}
+	return nil
+}
+
+// validateSelectWhere rejects ETag and Timestamp in SELECT WHERE clauses.
+// These are read-only pseudo-columns surfaced from entity meta fields, not
+// stored OData-queryable properties — the Table Storage service would reject
+// a filter like `ETag eq '...'`. They are selectable as result columns
+// (SELECT ETag, Timestamp FROM ...) but not usable as filter predicates.
+func validateSelectWhere(conds []whereCond) error {
+	for _, c := range conds {
+		if strings.EqualFold(c.column, "ETag") || strings.EqualFold(c.column, "Timestamp") {
+			return fmt.Errorf("aztablessql: %q is a read-only pseudo-column and cannot be used in a WHERE filter (it is not a stored, queryable property)", c.column)
+		}
 	}
 	return nil
 }
