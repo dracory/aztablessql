@@ -334,8 +334,17 @@ func formatODataPredicate(col string, val driver.Value) string {
 
 // wrapEDMType converts Go native types into their aztables EDM equivalents
 // so that the SDK serializes them with the correct Edm type annotations.
-// time.Time becomes EDMDateTime, []byte becomes EDMBinary, int64 becomes
-// EDMInt64. All other types pass through unchanged.
+//
+//   - time.Time  → EDMDateTime (Edm.DateTime)
+//   - []byte     → EDMBinary   (Edm.Binary)
+//   - int64      → EDMInt64    (Edm.Int64)
+//
+// float64, bool, string, and nil pass through unchanged. The Azure Table
+// Storage service infers their Edm types from the JSON value shape
+// (Edm.Double for float64, Edm.Boolean for bool, Edm.String for string).
+// This is a known limitation: if a column was created as Edm.Int32 but a
+// placeholder supplies a float64, the service may store it as Edm.Double.
+// Callers who need precise type control should pass int64 for integers.
 func wrapEDMType(v driver.Value) interface{} {
 	switch v := v.(type) {
 	case time.Time:

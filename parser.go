@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 type queryType int
@@ -43,11 +44,14 @@ var (
 	insertRe = regexp.MustCompile(`(?is)^INSERT\s+INTO\s+([A-Za-z0-9_]+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)\s*;?\s*$`)
 	deleteRe = regexp.MustCompile(`(?is)^DELETE\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*;?\s*$`)
 	selectRe = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*;?\s*$`)
-	// updateNoWhereRe matches UPDATE without a WHERE clause so we can give a
-	// clearer error than the generic "unsupported query" fallback.
-	updateNoWhereRe = regexp.MustCompile(`(?is)^UPDATE\s+([A-Za-z0-9_]+)\s+SET\s+(.+?)\s*;?\s*$`)
-	updateRe        = regexp.MustCompile(`(?is)^UPDATE\s+([A-Za-z0-9_]+)\s+SET\s+(.+?)\s+WHERE\s+(.+?)\s*;?\s*$`)
-	condRe          = regexp.MustCompile(`(?i)^([A-Za-z0-9_]+)\s*=\s*(\?|'[^']*'|"[^"]*")$`)
+	// updatePrefixRe matches the "UPDATE <table> SET " prefix. The SET and
+	// WHERE clauses are split manually by findUpdateSplit, which is
+	// quote-aware and handles quoted literals containing the word WHERE.
+	updatePrefixRe = regexp.MustCompile(`(?is)^UPDATE\s+([A-Za-z0-9_]+)\s+SET\s+`)
+	// condRe matches a single condition: col = ? | 'literal' | "literal".
+	// The single-quoted pattern ('(?:[^']|'')*') handles SQL-style doubled
+	// quote escapes ('') inside the literal. Same for double quotes.
+	condRe = regexp.MustCompile(`(?i)^([A-Za-z0-9_]+)\s*=\s*(\?|'(?:[^']|'')*'|"(?:[^"]|"")*")$`)
 )
 
 func parseQuery(query string) (*parsedQuery, error) {
@@ -68,34 +72,10 @@ func parseQuery(query string) (*parsedQuery, error) {
 		return &parsedQuery{kind: qInsert, table: table, columns: cols, numPlaceholders: len(cols)}, nil
 	}
 
-	if m := updateRe.FindStringSubmatch(q); m != nil {
-		table := m[1]
-		assigns, setN, err := parseSet(m[2])
-		if err != nil {
-			return nil, err
-		}
-		conds, whereN, err := parseWhere(m[3])
-		if err != nil {
-			return nil, err
-		}
-		if err := validateUpdateWhere(conds); err != nil {
-			return nil, err
-		}
-		return &parsedQuery{
-			kind:              qUpdate,
-			table:             table,
-			set:               assigns,
-			where:             conds,
-			numPlaceholders:   setN + whereN,
-			setPlaceholders:   setN,
-			wherePlaceholders: whereN,
-		}, nil
-	}
-
-	// Check for UPDATE without WHERE before falling through to the generic
-	// error, so the message is more helpful.
-	if updateNoWhereRe.MatchString(q) {
-		return nil, fmt.Errorf("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ?")
+	// UPDATE is parsed manually because the regex cannot be quote-aware
+	// when splitting SET ... WHERE ....
+	if m := updatePrefixRe.FindStringSubmatch(q); m != nil {
+		return parseUpdateQuery(m[1], q[len(m[0]):])
 	}
 
 	if m := deleteRe.FindStringSubmatch(q); m != nil {
@@ -126,6 +106,41 @@ func parseQuery(query string) (*parsedQuery, error) {
 	return nil, fmt.Errorf("aztablessql: unsupported query: %q", q)
 }
 
+// parseUpdateQuery parses the remainder after "UPDATE <table> SET ".
+// It uses a quote-aware scan to find the real WHERE keyword that separates
+// the SET clause from the WHERE clause.
+func parseUpdateQuery(table, rest string) (*parsedQuery, error) {
+	rest = strings.TrimRight(rest, " \t\n\r;")
+	// Find the unquoted WHERE that separates SET from WHERE.
+	wherePos := findUnquotedKeyword(rest, "WHERE")
+	if wherePos < 0 {
+		return nil, fmt.Errorf("aztablessql: UPDATE requires WHERE PartitionKey = ? AND RowKey = ?")
+	}
+	setStr := strings.TrimSpace(rest[:wherePos])
+	whereStr := strings.TrimSpace(rest[wherePos+len("WHERE"):])
+
+	assigns, setN, err := parseSet(setStr)
+	if err != nil {
+		return nil, err
+	}
+	conds, whereN, err := parseWhere(whereStr)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateUpdateWhere(conds); err != nil {
+		return nil, err
+	}
+	return &parsedQuery{
+		kind:              qUpdate,
+		table:             table,
+		set:               assigns,
+		where:             conds,
+		numPlaceholders:   setN + whereN,
+		setPlaceholders:   setN,
+		wherePlaceholders: whereN,
+	}, nil
+}
+
 func parseSet(setStr string) ([]setAssign, int, error) {
 	parts := splitOnComma(setStr)
 	var assigns []setAssign
@@ -143,7 +158,7 @@ func parseSet(setStr string) ([]setAssign, int, error) {
 			assigns = append(assigns, setAssign{column: col, isPlaceholder: true})
 			n++
 		} else {
-			assigns = append(assigns, setAssign{column: col, value: strings.Trim(tok, `'"`)})
+			assigns = append(assigns, setAssign{column: col, value: unquoteLiteral(tok)})
 		}
 	}
 	if len(assigns) == 0 {
@@ -186,7 +201,7 @@ func parseWhere(whereStr string) ([]whereCond, int, error) {
 			conds = append(conds, whereCond{column: col, isPlaceholder: true})
 			n++
 		} else {
-			conds = append(conds, whereCond{column: col, value: strings.Trim(tok, `'"`)})
+			conds = append(conds, whereCond{column: col, value: unquoteLiteral(tok)})
 		}
 	}
 	return conds, n, nil
@@ -204,40 +219,76 @@ func splitAndTrim(s, sep string) []string {
 	return out
 }
 
-// splitOnComma splits a string on commas, but respects single-quoted
-// literals so that a comma inside 'Doe, Jr' does not cause a split.
+// unquoteLiteral removes the outer quote character from a quoted literal
+// token (e.g. 'hello' → hello, "world" → world). Only the matching outer
+// quote is stripped; inner quotes of the other type are preserved.
+// Doubled quotes inside the literal (SQL escaping, e.g. 'It”s') are
+// collapsed to a single quote.
+func unquoteLiteral(tok string) string {
+	if len(tok) < 2 {
+		return tok
+	}
+	outer := tok[0]
+	if outer != '\'' && outer != '"' {
+		return tok
+	}
+	inner := tok[1 : len(tok)-1]
+	// Collapse doubled outer-quote characters: '' → ', "" → "
+	inner = strings.ReplaceAll(inner, string(outer)+string(outer), string(outer))
+	return inner
+}
+
+// splitOnComma splits a string on commas, but respects single- and
+// double-quoted literals (including doubled-quote escapes) so that a
+// comma inside 'Doe, Jr' or "Doe, Jr" does not cause a split.
 func splitOnComma(s string) []string {
 	return splitQuoteAware(s, ',')
 }
 
 // splitOnAND splits a string on the keyword AND (case-insensitive, surrounded
-// by whitespace), but respects single-quoted literals so that AND inside
-// 'A and B' does not cause a split.
+// by whitespace), but respects single- and double-quoted literals so that AND
+// inside 'A and B' or "A and B" does not cause a split.
 func splitOnAND(s string) []string {
 	var parts []string
 	var current strings.Builder
-	inQuote := false
+	inSingle, inDouble := false, false
 
 	s = strings.TrimSpace(s)
 
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
-		if ch == '\'' {
-			inQuote = !inQuote
+		if ch == '\'' && !inDouble {
+			if inSingle && i+1 < len(s) && s[i+1] == '\'' {
+				// Doubled quote escape — consume both, stay in quote.
+				current.WriteByte(ch)
+				current.WriteByte(ch)
+				i++
+				continue
+			}
+			inSingle = !inSingle
 			current.WriteByte(ch)
 			continue
 		}
-		if !inQuote {
-			// Check for " AND " or " and " (case-insensitive) surrounded by whitespace.
+		if ch == '"' && !inSingle {
+			if inDouble && i+1 < len(s) && s[i+1] == '"' {
+				current.WriteByte(ch)
+				current.WriteByte(ch)
+				i++
+				continue
+			}
+			inDouble = !inDouble
+			current.WriteByte(ch)
+			continue
+		}
+		if !inSingle && !inDouble {
 			if i > 0 && current.Len() > 0 && isANDAt(s, i) {
 				parts = append(parts, strings.TrimSpace(current.String()))
 				current.Reset()
-				i += 4 // skip "AND " (the leading space was already consumed)
-				// skip trailing space after AND
-				for i < len(s) && s[i] == ' ' {
+				i += 3 // skip "AND" — i now points to last char of AND
+				// skip trailing whitespace after AND
+				for i+1 < len(s) && isSpaceByte(string(s[i+1])) {
 					i++
 				}
-				i-- // compensate for loop increment
 				continue
 			}
 		}
@@ -249,44 +300,67 @@ func splitOnAND(s string) []string {
 	return parts
 }
 
-// isANDAt checks whether s[pos:] starts with "AND " or "AND" at end,
-// case-insensitively, preceded by whitespace (already checked by caller).
+// isANDAt checks whether s[pos:] starts with "AND" (case-insensitive),
+// preceded by whitespace and followed by whitespace or end of string.
 func isANDAt(s string, pos int) bool {
-	// Need at least "AND" (3 chars) and the char before pos must be a space
-	// (guaranteed by caller context). We check for "AND" followed by space or end.
 	if pos+3 > len(s) {
 		return false
 	}
-	// Check the char before is whitespace
-	if pos == 0 || s[pos-1] != ' ' {
+	if pos == 0 || !isSpaceByte(string(s[pos-1])) {
 		return false
 	}
 	rest := s[pos : pos+3]
 	if !strings.EqualFold(rest, "AND") {
 		return false
 	}
-	// Must be followed by whitespace or end of string
 	if pos+3 == len(s) {
 		return true
 	}
-	return s[pos+3] == ' ' || s[pos+3] == '\t'
+	return isSpaceByte(string(s[pos+3]))
+}
+
+// isSpaceByte returns true if the byte is whitespace (space, tab, newline,
+// carriage return).
+func isSpaceByte(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	return unicode.IsSpace(rune(s[0]))
 }
 
 // splitQuoteAware splits on a single-byte delimiter while respecting
-// single-quoted literals. The delimiter inside quotes is preserved.
+// single- and double-quoted literals (including doubled-quote escapes).
+// The delimiter inside quotes is preserved.
 func splitQuoteAware(s string, delim byte) []string {
 	var parts []string
 	var current strings.Builder
-	inQuote := false
+	inSingle, inDouble := false, false
 
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
-		if ch == '\'' {
-			inQuote = !inQuote
+		if ch == '\'' && !inDouble {
+			if inSingle && i+1 < len(s) && s[i+1] == '\'' {
+				current.WriteByte(ch)
+				current.WriteByte(ch)
+				i++
+				continue
+			}
+			inSingle = !inSingle
 			current.WriteByte(ch)
 			continue
 		}
-		if ch == delim && !inQuote {
+		if ch == '"' && !inSingle {
+			if inDouble && i+1 < len(s) && s[i+1] == '"' {
+				current.WriteByte(ch)
+				current.WriteByte(ch)
+				i++
+				continue
+			}
+			inDouble = !inDouble
+			current.WriteByte(ch)
+			continue
+		}
+		if ch == delim && !inSingle && !inDouble {
 			parts = append(parts, strings.TrimSpace(current.String()))
 			current.Reset()
 			continue
@@ -297,4 +371,47 @@ func splitQuoteAware(s string, delim byte) []string {
 		parts = append(parts, strings.TrimSpace(current.String()))
 	}
 	return parts
+}
+
+// findUnquotedKeyword scans s for the keyword (case-insensitive) outside of
+// single- or double-quoted literals (including doubled-quote escapes).
+// Returns the byte position of the keyword, or -1 if not found.
+// The keyword must be preceded by whitespace (or start of string) and
+// followed by whitespace (or end of string).
+func findUnquotedKeyword(s, keyword string) int {
+	upper := strings.ToUpper(s)
+	target := strings.ToUpper(keyword)
+	tlen := len(target)
+	inSingle, inDouble := false, false
+
+	for i := 0; i < len(upper); i++ {
+		ch := upper[i]
+		if ch == '\'' && !inDouble {
+			if inSingle && i+1 < len(upper) && upper[i+1] == '\'' {
+				i++ // skip doubled quote
+				continue
+			}
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			if inDouble && i+1 < len(upper) && upper[i+1] == '"' {
+				i++ // skip doubled quote
+				continue
+			}
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		if i+tlen <= len(upper) && upper[i:i+tlen] == target {
+			beforeOK := i == 0 || unicode.IsSpace(rune(upper[i-1]))
+			afterOK := i+tlen == len(upper) || unicode.IsSpace(rune(upper[i+tlen]))
+			if beforeOK && afterOK {
+				return i
+			}
+		}
+	}
+	return -1
 }

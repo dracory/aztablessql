@@ -383,6 +383,155 @@ func TestParseWhereWithANDInLiteral(t *testing.T) {
 	}
 }
 
+func TestParseSetWithCommaInDoubleQuotedLiteral(t *testing.T) {
+	pq, err := parseQuery(`UPDATE People SET Name = "Doe, Jr", Age = ? WHERE PartitionKey = ? AND RowKey = ?`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.set) != 2 {
+		t.Fatalf("expected 2 SET assignments, got %d", len(pq.set))
+	}
+	if pq.set[0].column != "Name" || pq.set[0].value != "Doe, Jr" {
+		t.Errorf("set[0] = {col: %q, val: %q}, want {col: \"Name\", val: \"Doe, Jr\"}", pq.set[0].column, pq.set[0].value)
+	}
+}
+
+func TestParseWhereWithANDInDoubleQuotedLiteral(t *testing.T) {
+	pq, err := parseQuery(`SELECT * FROM T WHERE Note = "A and B" AND PartitionKey = ?`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.where) != 2 {
+		t.Fatalf("expected 2 WHERE conditions, got %d", len(pq.where))
+	}
+	if pq.where[0].column != "Note" || pq.where[0].value != "A and B" {
+		t.Errorf("where[0] = {col: %q, val: %q}, want {col: \"Note\", val: \"A and B\"}", pq.where[0].column, pq.where[0].value)
+	}
+}
+
+func TestFindUnquotedKeyword(t *testing.T) {
+	cases := []struct {
+		s       string
+		keyword string
+		want    bool // true = found (pos >= 0)
+	}{
+		{"Name = 'x' WHERE", "WHERE", true},
+		{"Name = 'WHERE clause'", "WHERE", false},
+		{`Name = "WHERE clause"`, "WHERE", false},
+		{"Name = 'x'", "WHERE", false},
+		{"WHERE x = 1", "WHERE", true},
+		{"Name = 'x' where y = 1", "WHERE", true},
+		{`Name = "x and where y"`, "WHERE", false},
+		{"Name = 'x'\nWHERE y = 1", "WHERE", true},
+		{"Name = 'x'\r\nWHERE y = 1", "WHERE", true},
+		{"Name = 'x'\tWHERE y = 1", "WHERE", true},
+	}
+	for _, c := range cases {
+		pos := findUnquotedKeyword(c.s, c.keyword)
+		got := pos >= 0
+		if got != c.want {
+			t.Errorf("findUnquotedKeyword(%q, %q) pos=%d, want found=%v", c.s, c.keyword, pos, c.want)
+		}
+	}
+}
+
+func TestParseUpdateWithWhereInQuotedSet(t *testing.T) {
+	// The word WHERE inside a double-quoted literal in the SET clause
+	// must not be mistaken for the real WHERE keyword.
+	pq, err := parseQuery(`UPDATE People SET Name = "x WHERE y" WHERE PartitionKey = ? AND RowKey = ?`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.set) != 1 || pq.set[0].column != "Name" || pq.set[0].value != "x WHERE y" {
+		t.Errorf("set = %v, want [{Name x WHERE y}]", pq.set)
+	}
+	if len(pq.where) != 2 {
+		t.Errorf("expected 2 WHERE conditions, got %d", len(pq.where))
+	}
+}
+
+func TestParseUpdateWithWhereInSingleQuotedSet(t *testing.T) {
+	pq, err := parseQuery(`UPDATE People SET Name = 'x WHERE y' WHERE PartitionKey = ? AND RowKey = ?`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.set) != 1 || pq.set[0].column != "Name" || pq.set[0].value != "x WHERE y" {
+		t.Errorf("set = %v, want [{Name x WHERE y}]", pq.set)
+	}
+}
+
+func TestUnquoteLiteralPreservesInnerQuotes(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{`'He said "hi"'`, `He said "hi"`},
+		{`"He said 'hi'"`, `He said 'hi'`},
+		{`'It''s'`, `It's`},
+		{`"She said ""hi"""`, `She said "hi"`},
+		{`'simple'`, `simple`},
+		{`"simple"`, `simple`},
+		{`?`, `?`},
+	}
+	for _, c := range cases {
+		if got := unquoteLiteral(c.input); got != c.want {
+			t.Errorf("unquoteLiteral(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestParseSetWithDoubledQuoteEscape(t *testing.T) {
+	pq, err := parseQuery(`UPDATE People SET Name = 'It''s', Age = ? WHERE PartitionKey = ? AND RowKey = ?`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.set) != 2 {
+		t.Fatalf("expected 2 SET assignments, got %d", len(pq.set))
+	}
+	if pq.set[0].value != "It's" {
+		t.Errorf("set[0].value = %q, want %q", pq.set[0].value, "It's")
+	}
+}
+
+func TestParseWhereWithDoubledQuoteEscape(t *testing.T) {
+	pq, err := parseQuery(`SELECT * FROM T WHERE Note = 'It''s a test' AND PartitionKey = ?`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.where) != 2 {
+		t.Fatalf("expected 2 WHERE conditions, got %d", len(pq.where))
+	}
+	if pq.where[0].value != "It's a test" {
+		t.Errorf("where[0].value = %q, want %q", pq.where[0].value, "It's a test")
+	}
+}
+
+func TestParseWhereWithTabSeparatedAND(t *testing.T) {
+	pq, err := parseQuery("SELECT * FROM T WHERE Note = 'A and B'\tAND PartitionKey = ?")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.where) != 2 {
+		t.Fatalf("expected 2 WHERE conditions, got %d", len(pq.where))
+	}
+	if pq.where[0].value != "A and B" {
+		t.Errorf("where[0].value = %q, want %q", pq.where[0].value, "A and B")
+	}
+}
+
+func TestParseUpdateWithNewlineBeforeWhere(t *testing.T) {
+	pq, err := parseQuery("UPDATE People SET Name = ?\nWHERE PartitionKey = ? AND RowKey = ?")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pq.set) != 1 || pq.set[0].column != "Name" {
+		t.Errorf("set = %v, want [{Name}]", pq.set)
+	}
+	if len(pq.where) != 2 {
+		t.Errorf("expected 2 WHERE conditions, got %d", len(pq.where))
+	}
+}
+
 func TestParseWherePreservesColumnCase(t *testing.T) {
 	pq, err := parseQuery("SELECT * FROM T WHERE MyCol = ? AND PartitionKey = ?")
 	if err != nil {
