@@ -1,0 +1,87 @@
+# This workflow will build and test the aztablessql Go package.
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    services:
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite
+        ports:
+          - "10002:10002"
+        options: >-
+          --health-cmd="node -e \"const http=require('http');const r=http.request({host:'127.0.0.1',port:10002,path:'/TableStorage',method:'GET',timeout:2000},res=>{process.exit(res.statusCode<500?0:1)});r.on('error',()=>process.exit(1));r.on('timeout',()=>{r.destroy();process.exit(1)});r.end();\""
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      # Well-known Azurite dev-store connection string pointing at the
+      # service container's Table endpoint.
+      AZTABLES_TEST_CONNSTR: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;"
+      GITHUB_ACTIONS: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://${{ github.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Wait for Azurite Table service
+        run: |
+          echo "Waiting for Azurite Table service to be ready..."
+          for i in {1..30}; do
+            if node -e "const http=require('http');const r=http.request({host:'127.0.0.1',port:10002,path:'/TableStorage',method:'GET',timeout:2000},res=>{process.exit(res.statusCode<500?0:1)});r.on('error',()=>process.exit(1));r.on('timeout',()=>{r.destroy();process.exit(1)});r.end();" 2>/dev/null; then
+              echo "Azurite Table service is ready!"
+              break
+            fi
+            echo "Attempt $i: Azurite not ready, waiting..."
+            sleep 2
+          done
+
+      - name: Verify Azurite Table connection
+        run: |
+          echo "Azurite Table service is running on port 10002"
+          curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:10002/TableStorage || true
+          echo ""
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          cache: true
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Run golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+          $(go env GOPATH)/bin/golangci-lint run --timeout 10m
+
+      - name: Run gosec security scanning
+        if: always()
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          $(go env GOPATH)/bin/gosec ./... || true
+
+      - name: Run unit tests
+        run: go test -v -coverprofile=coverage_unit.out ./...
+
+      - name: Run integration tests
+        run: go test -v -tags=integration -coverprofile=coverage_integration.out ./...
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
