@@ -1,6 +1,7 @@
 package aztablessql
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -16,6 +17,9 @@ const (
 	qInsert
 	qDelete
 	qUpdate
+	qCreateTable
+	qDropTable
+	qShowTables
 )
 
 // upsertMode distinguishes the three INSERT-family execution strategies.
@@ -55,6 +59,8 @@ type parsedQuery struct {
 	setPlaceholders   int
 	wherePlaceholders int
 	upsert            upsertMode // INSERT-family execution strategy
+	ifNotExists       bool       // CREATE TABLE IF NOT EXISTS
+	ifExists          bool       // DROP TABLE IF EXISTS
 }
 
 var (
@@ -79,10 +85,44 @@ var (
 	// The single-quoted pattern ('(?:[^']|'')*') handles SQL-style doubled
 	// quote escapes ('') inside the literal. Same for double quotes.
 	condRe = regexp.MustCompile(`(?i)^([A-Za-z0-9_]+)\s*(=|!=|<>|>=|<=|>|<)\s*(\?|'(?:[^']|'')*'|"(?:[^"]|"")*")$`)
+	// DDL regexes. CREATE/DROP TABLE accept an optional IF NOT EXISTS / IF
+	// EXISTS clause. The IF clause is captured (group 1) so the flag is set
+	// from the actual match rather than a fragile substring search — this
+	// keeps the flag correct when the input has irregular whitespace inside
+	// the clause (e.g. "IF  NOT EXISTS"), which the \s+ in the regex
+	// tolerates but strings.Contains("IF NOT EXISTS") would miss.
+	// Column definitions are rejected separately (see createTableWithColsRe)
+	// with a "schemaless" message rather than a generic "unsupported query".
+	createTableRe = regexp.MustCompile(`(?is)^CREATE\s+TABLE\s+(?:(IF\s+NOT\s+EXISTS)\s+)?([A-Za-z0-9_]+)\s*;?\s*$`)
+	dropTableRe   = regexp.MustCompile(`(?is)^DROP\s+TABLE\s+(?:(IF\s+EXISTS)\s+)?([A-Za-z0-9_]+)\s*;?\s*$`)
+	showTablesRe  = regexp.MustCompile(`(?is)^SHOW\s+TABLES\s*;?\s*$`)
+	// createTableWithColsRe detects a CREATE TABLE followed by a column
+	// definition list `( ... )` so we can reject it with a clear message
+	// instead of falling through to "unsupported query". Table Storage is
+	// schemaless — column definitions are meaningless.
+	createTableWithColsRe = regexp.MustCompile(`(?is)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[A-Za-z0-9_]+\s*\(`)
 )
 
 func parseQuery(query string) (*parsedQuery, error) {
 	q := strings.TrimSpace(query)
+
+	// DDL statements (CREATE/DROP TABLE, SHOW TABLES) are matched first
+	// because they are structurally distinct from DML and have no
+	// placeholders.
+	if m := createTableRe.FindStringSubmatch(q); m != nil {
+		return &parsedQuery{kind: qCreateTable, table: m[2], ifNotExists: m[1] != ""}, nil
+	}
+	// Reject CREATE TABLE with column definitions before falling through
+	// to the generic "unsupported query" error so the message is helpful.
+	if createTableWithColsRe.MatchString(q) {
+		return nil, errors.New("aztablessql: CREATE TABLE does not accept column definitions — Table Storage is schemaless (properties are per-entity)")
+	}
+	if m := dropTableRe.FindStringSubmatch(q); m != nil {
+		return &parsedQuery{kind: qDropTable, table: m[2], ifExists: m[1] != ""}, nil
+	}
+	if showTablesRe.MatchString(q) {
+		return &parsedQuery{kind: qShowTables}, nil
+	}
 
 	if m := upsertRe.FindStringSubmatch(q); m != nil {
 		mode := upsertReplace // UPSERT INTO defaults to replace

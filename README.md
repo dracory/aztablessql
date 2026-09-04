@@ -117,6 +117,9 @@ func main() {
 | **SELECT** | `SELECT * FROM <table> [WHERE ...]` or `SELECT col1, col2 FROM <table> [WHERE ...]` | Point read when `WHERE PartitionKey = ? AND RowKey = ?` (uses `GetEntity`). Otherwise falls back to `ListEntities` with an OData filter. |
 | **UPDATE** | `UPDATE <table> SET col1 = ?, col2 = ? WHERE PartitionKey = ? AND RowKey = ? [AND ETag = ?]` | Merge semantics — only SET columns are touched, existing properties are preserved. `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`, optionally followed by `AND ETag = ?` for optimistic concurrency. Cannot SET `PartitionKey`, `RowKey`, `ETag`, or `Timestamp`. |
 | **DELETE** | `DELETE FROM <table> WHERE PartitionKey = ? AND RowKey = ? [AND ETag = ?]` | `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`, optionally followed by `AND ETag = ?` for optimistic concurrency. Extra conditions are rejected. |
+| **CREATE TABLE** | `CREATE TABLE [IF NOT EXISTS] <table>` | Creates a Table Storage table. `IF NOT EXISTS` makes a duplicate create a no-op (tolerates 409 Conflict). Column definitions are rejected — Table Storage is schemaless, properties are per-entity. |
+| **DROP TABLE** | `DROP TABLE [IF EXISTS] <table>` | Deletes a table. `IF EXISTS` makes dropping a missing table a no-op (tolerates 404 Not Found). |
+| **SHOW TABLES** | `SHOW TABLES` | Lists all tables on the account. Returns a single `TableName` column. |
 
 ### Upsert
 
@@ -215,6 +218,23 @@ err = conn.Raw(func(driverConn any) error {
 `BatchKind` values: `BatchInsert`, `BatchInsertMerge`, `BatchInsertReplace`, `BatchUpdateMerge`, `BatchUpdateReplace`, `BatchDelete`.
 
 Each op may carry an optional `ETag` (the special value `"*"` matches any existing ETag). The driver validates client-side that all ops share one `PartitionKey`, that there are at most 100 ops, and that no `RowKey` is targeted twice within a batch — a single failing op rolls back the entire batch atomically. The total payload size limit (~4 MiB per batch) is enforced by the service; oversized batches are rejected server-side.
+
+## Table management (DDL)
+
+The driver supports basic table-level DDL mapped onto `ServiceClient.CreateTable` / `DeleteTable` / `NewListTablesPager`:
+
+```sql
+CREATE TABLE People
+CREATE TABLE IF NOT EXISTS People
+DROP TABLE People
+DROP TABLE IF EXISTS People
+SHOW TABLES
+```
+
+- `CREATE TABLE` / `DROP TABLE` go through `db.Exec` and return a `RowsAffected` of 1 on success, 0 when an `IF NOT EXISTS` / `IF EXISTS` clause turns the call into a no-op.
+- `SHOW TABLES` goes through `db.Query` and returns a single `TableName` column with one row per table on the account.
+- Column definitions are **rejected** (`CREATE TABLE People (PartitionKey, RowKey, Name)`) with a clear "Table Storage is schemaless" error — properties are per-entity, not per-table.
+- Table names are validated by the service (must start with a letter, be 3–63 chars, alphanumeric). The parser stays permissive and lets the server reject invalid names.
 
 ## Type handling
 

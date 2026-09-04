@@ -44,8 +44,12 @@ func (s *Stmt) exec(ctx context.Context, args []driver.Value) (driver.Result, er
 		return s.execUpdate(ctx, args)
 	case qDelete:
 		return s.execDelete(ctx, args)
+	case qCreateTable:
+		return s.execCreateTable(ctx)
+	case qDropTable:
+		return s.execDropTable(ctx)
 	default:
-		return nil, errors.New("aztablessql: Exec not supported for SELECT, use Query")
+		return nil, errors.New("aztablessql: Exec not supported for SELECT/SHOW TABLES, use Query")
 	}
 }
 
@@ -63,10 +67,14 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.Value) (driver.Ro
 }
 
 func (s *Stmt) query(ctx context.Context, args []driver.Value) (driver.Rows, error) {
-	if s.pq.kind != qSelect {
-		return nil, errors.New("aztablessql: Query only supported for SELECT")
+	switch s.pq.kind {
+	case qSelect:
+		return s.execSelect(ctx, args)
+	case qShowTables:
+		return s.execShowTables(ctx)
+	default:
+		return nil, errors.New("aztablessql: Query only supported for SELECT and SHOW TABLES")
 	}
-	return s.execSelect(ctx, args)
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +225,67 @@ func (s *Stmt) execDelete(ctx context.Context, args []driver.Value) (driver.Resu
 		return nil, wrapPreconditionFailed(err)
 	}
 	return driverResult{rowsAffected: 1}, nil
+}
+
+// ---------------------------------------------------------------------------
+// DDL — CREATE TABLE / DROP TABLE / SHOW TABLES
+// ---------------------------------------------------------------------------
+
+// execCreateTable creates a Table Storage table. When IF NOT EXISTS is set,
+// a 409 Conflict with ErrorCode "TableAlreadyExists" is tolerated as a
+// no-op. Other 409s (e.g. TableBeingDeleted) are surfaced as errors so a
+// misleading "already exists" is not returned for a different failure.
+func (s *Stmt) execCreateTable(ctx context.Context) (driver.Result, error) {
+	_, err := s.conn.svc.CreateTable(ctx, s.pq.table, nil)
+	if err != nil {
+		if s.pq.ifNotExists && isTableAlreadyExists(err) {
+			return driverResult{rowsAffected: 0}, nil
+		}
+		return nil, err
+	}
+	return driverResult{rowsAffected: 1}, nil
+}
+
+// execDropTable deletes a Table Storage table. When IF EXISTS is set, a 404
+// Not Found with ErrorCode "TableNotFound" is tolerated as a no-op. Other
+// 404s are surfaced as errors.
+func (s *Stmt) execDropTable(ctx context.Context) (driver.Result, error) {
+	_, err := s.conn.svc.DeleteTable(ctx, s.pq.table, nil)
+	if err != nil {
+		if s.pq.ifExists && isTableNotFound(err) {
+			return driverResult{rowsAffected: 0}, nil
+		}
+		return nil, err
+	}
+	return driverResult{rowsAffected: 1}, nil
+}
+
+// execShowTables lists all tables on the account and returns a Rows with a
+// single "TableName" column. Tables are eagerly fetched because the number
+// of tables per account is typically small (dozens, not thousands) and the
+// existing Rows pager is typed for entity pages, not table pages. Each
+// table is serialized as {"TableName":"<name>"} JSON so the existing
+// Rows.decodeEntity / resolveColumnValue path works unchanged.
+func (s *Stmt) execShowTables(ctx context.Context) (driver.Rows, error) {
+	pager := s.conn.svc.NewListTablesPager(nil)
+	var entities [][]byte
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, tbl := range resp.Tables {
+			if tbl.Name == nil {
+				continue
+			}
+			b, err := json.Marshal(map[string]string{"TableName": *tbl.Name})
+			if err != nil {
+				return nil, err
+			}
+			entities = append(entities, b)
+		}
+	}
+	return &Rows{columns: []string{"TableName"}, entities: entities}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +641,40 @@ func isNotFound(err error) bool {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
 		return respErr.StatusCode == 404
+	}
+	return false
+}
+
+// isTableAlreadyExists reports whether err is the specific 409 Conflict
+// returned by CreateTable when the table already exists. The Table Storage
+// service can return 409 for other reasons (e.g. TableBeingDeleted), so
+// CREATE TABLE IF NOT EXISTS only swallows this specific ErrorCode rather
+// than every 409 — otherwise a "table is being deleted" failure would be
+// silently treated as "already exists".
+func isTableAlreadyExists(err error) bool {
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == 409 && respErr.ErrorCode == "TableAlreadyExists"
+	}
+	return false
+}
+
+// isTableNotFound reports whether err is the 404 Not Found returned by
+// DeleteTable when the table does not exist. Both the table-specific
+// ErrorCode "TableNotFound" (per the REST docs) and the generic
+// "ResourceNotFound" (returned by Azurite and some service paths) are
+// accepted, so DROP TABLE IF EXISTS behaves consistently across the
+// emulator and the real Azure service. Other 404s are not masked.
+func isTableNotFound(err error) bool {
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		if respErr.StatusCode != 404 {
+			return false
+		}
+		switch respErr.ErrorCode {
+		case "TableNotFound", "ResourceNotFound":
+			return true
+		}
 	}
 	return false
 }
