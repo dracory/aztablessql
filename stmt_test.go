@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeKeyName(t *testing.T) {
@@ -41,6 +42,9 @@ func TestFormatODataPredicate(t *testing.T) {
 		{"int64", "Age", int64(36), "Age eq 36"},
 		{"float whole", "Age", float64(36), "Age eq 36"},
 		{"float fractional", "Score", float64(3.14), "Score eq 3.14"},
+		{"float overflow", "Big", float64(9.2233720368547758e+19), "Big eq 9.223372036854776e+19"},
+		{"time", "CreatedAt", time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC), "CreatedAt eq datetime'2026-09-04T12:00:00.0000000Z'"},
+		{"bytes", "Data", []byte{0xAB, 0xCD}, "Data eq X'abcd'"},
 		{"nil", "Optional", nil, "Optional eq null"},
 	}
 	for _, c := range cases {

@@ -3,6 +3,7 @@ package aztablessql
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sort"
 )
@@ -59,10 +60,10 @@ func (r *Rows) Next(dest []driver.Value) error {
 		return err
 	}
 	cols := r.Columns()
+	if len(dest) < len(cols) {
+		return fmt.Errorf("aztablessql: destination slice too short: got %d, want %d", len(dest), len(cols))
+	}
 	for i, c := range cols {
-		if i >= len(dest) {
-			break
-		}
 		dest[i] = m[c]
 	}
 	r.pos++

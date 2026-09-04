@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
@@ -247,6 +248,8 @@ func normalizeKeyName(col string) string {
 // formatODataPredicate renders a single `col eq <value>` OData predicate,
 // quoting the value only when it is a string. Numeric and boolean values
 // are emitted unquoted so that OData type matching works correctly.
+// time.Time is formatted as an OData datetime literal. []byte is formatted
+// as an Edm.Binary literal (X'hex').
 func formatODataPredicate(col string, val driver.Value) string {
 	switch v := val.(type) {
 	case string:
@@ -260,10 +263,16 @@ func formatODataPredicate(col string, val driver.Value) string {
 	case float64:
 		// JSON numbers arrive as float64. Emit as integer when the value
 		// is a whole number to avoid `42.000000` in the filter.
-		if v == float64(int64(v)) {
+		// Guard against overflow: if the value exceeds int64 range, emit
+		// as a float instead of wrapping.
+		if v >= -9.2233720368547758e+18 && v <= 9.2233720368547758e+18 && v == float64(int64(v)) {
 			return fmt.Sprintf("%s eq %d", col, int64(v))
 		}
 		return fmt.Sprintf("%s eq %g", col, v)
+	case time.Time:
+		return fmt.Sprintf("%s eq datetime'%s'", col, v.UTC().Format("2006-01-02T15:04:05.0000000Z"))
+	case []byte:
+		return fmt.Sprintf("%s eq X'%x'", col, v)
 	case nil:
 		return fmt.Sprintf("%s eq null", col)
 	default:
