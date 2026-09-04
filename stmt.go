@@ -72,8 +72,10 @@ func (s *Stmt) query(ctx context.Context, args []driver.Value) (driver.Rows, err
 		return s.execSelect(ctx, args)
 	case qShowTables:
 		return s.execShowTables(ctx)
+	case qCount:
+		return s.execCount(ctx, args)
 	default:
-		return nil, errors.New("aztablessql: Query only supported for SELECT and SHOW TABLES")
+		return nil, errors.New("aztablessql: Query only supported for SELECT, SHOW TABLES and COUNT(*)")
 	}
 }
 
@@ -356,6 +358,64 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 		page:    resp.Entities,
 		pagePos: 0,
 		ctx:     ctx,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// COUNT(*)
+// ---------------------------------------------------------------------------
+
+// execCount runs SELECT COUNT(*). Table Storage has no server-side count, so
+// this enumerates all matching entities client-side by iterating the list
+// pager to completion and incrementing a counter per entity. Pages are
+// discarded as they are consumed so memory stays bounded to one page.
+//
+// This is O(n) and can be slow/expensive on large tables — there is no way
+// around that with Table Storage. Callers should scope the count with a
+// WHERE filter on PartitionKey (a point or range scan) whenever possible.
+//
+// The result is a Rows with a single column "count" and a single row holding
+// the count. The count is encoded as a one-entity JSON blob {"count": N} so
+// the existing Rows.decodeEntity / resolveColumnValue path works unchanged;
+// like all SELECT return values, the decoded value follows encoding/json's
+// default typing (the number arrives as float64 — see the README "SELECT
+// return values" section).
+func (s *Stmt) execCount(ctx context.Context, args []driver.Value) (driver.Rows, error) {
+	conds, err := resolveWhere(s.pq.where, args)
+	if err != nil {
+		return nil, err
+	}
+	client := s.conn.svc.NewClient(s.pq.table)
+
+	opts := &aztables.ListEntitiesOptions{}
+	if filter := buildODataFilter(conds); filter != "" {
+		opts.Filter = &filter
+	}
+	// Project only PartitionKey to minimize wire payload — we discard the
+	// entity bodies and just count them. PartitionKey is always present on
+	// every entity, so this is a safe minimal projection. $select does not
+	// affect $filter matching, so the WHERE semantics are unchanged.
+	sel := "PartitionKey"
+	opts.Select = &sel
+	// Iterate the pager to completion, counting entities per page without
+	// materializing the full result set into memory.
+	pager := client.NewListEntitiesPager(opts)
+	var count int64
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		count += int64(len(resp.Entities))
+	}
+
+	b, err := json.Marshal(map[string]int64{"count": count})
+	if err != nil {
+		return nil, err
+	}
+	return &Rows{
+		columns:  []string{"count"},
+		entities: [][]byte{b},
 	}, nil
 }
 

@@ -114,12 +114,13 @@ func main() {
 | **INSERT OR REPLACE** | `INSERT OR REPLACE INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Upsert with replace semantics — if the entity exists, it is fully replaced (properties not in the column list are dropped). Maps to `UpsertEntity` with `UpdateModeReplace`. |
 | **INSERT OR MERGE** | `INSERT OR MERGE INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Upsert with merge semantics — if the entity exists, only the supplied properties are updated; existing properties are preserved. Maps to `UpsertEntity` with `UpdateModeMerge`. |
 | **UPSERT INTO** | `UPSERT INTO <table> (col1, col2, ...) VALUES (?, ?, ...)` | Alias for `INSERT OR REPLACE`. |
-| **SELECT** | `SELECT * FROM <table> [WHERE ...]` or `SELECT col1, col2 FROM <table> [WHERE ...]` | Point read when `WHERE PartitionKey = ? AND RowKey = ?` (uses `GetEntity`). Otherwise falls back to `ListEntities` with an OData filter. |
+| **SELECT** | `SELECT * FROM <table> [WHERE ...] [LIMIT n]` or `SELECT col1, col2 FROM <table> [WHERE ...] [LIMIT n]` | Point read when `WHERE PartitionKey = ? AND RowKey = ?` (uses `GetEntity`). Otherwise falls back to `ListEntities` with an OData filter. `LIMIT n` (n ≥ 1) caps the result set via server-side `$top` with a client-side backstop. |
 | **UPDATE** | `UPDATE <table> SET col1 = ?, col2 = ? WHERE PartitionKey = ? AND RowKey = ? [AND ETag = ?]` | Merge semantics — only SET columns are touched, existing properties are preserved. `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`, optionally followed by `AND ETag = ?` for optimistic concurrency. Cannot SET `PartitionKey`, `RowKey`, `ETag`, or `Timestamp`. |
 | **DELETE** | `DELETE FROM <table> WHERE PartitionKey = ? AND RowKey = ? [AND ETag = ?]` | `WHERE` must be exactly `PartitionKey = ? AND RowKey = ?`, optionally followed by `AND ETag = ?` for optimistic concurrency. Extra conditions are rejected. |
 | **CREATE TABLE** | `CREATE TABLE [IF NOT EXISTS] <table>` | Creates a Table Storage table. `IF NOT EXISTS` makes a duplicate create a no-op (tolerates 409 Conflict). Column definitions are rejected — Table Storage is schemaless, properties are per-entity. |
 | **DROP TABLE** | `DROP TABLE [IF EXISTS] <table>` | Deletes a table. `IF EXISTS` makes dropping a missing table a no-op (tolerates 404 Not Found). |
 | **SHOW TABLES** | `SHOW TABLES` | Lists all tables on the account. Returns a single `TableName` column. |
+| **SELECT COUNT(\*)** | `SELECT COUNT(*) FROM <table> [WHERE ...]` | Returns a single row with a single `count` column. See [COUNT(*)](#count) below — it is O(n) and has no server-side shortcut. |
 
 ### Upsert
 
@@ -148,6 +149,17 @@ SELECT * FROM People WHERE PartitionKey = ? AND Age > ?
 SELECT * FROM People WHERE PartitionKey >= 'a' AND PartitionKey < 'b'
 SELECT * FROM People WHERE Name != 'Bob'
 ```
+
+#### LIMIT
+
+`SELECT` accepts an optional trailing `LIMIT n` (n ≥ 1, integer literal — placeholders are not accepted). It caps the number of rows returned:
+
+```sql
+SELECT * FROM People WHERE PartitionKey = ? LIMIT 50
+SELECT Name, Age FROM People LIMIT 10
+```
+
+The limit is pushed down to the server via the OData `$top` parameter so the service short-circuits the query and avoids fetching pages that would be discarded. A client-side cap is also enforced as a defensive backstop. `LIMIT` is only accepted on `SELECT` (not `COUNT(*)`, `UPDATE`, `DELETE`, or `INSERT`).
 
 #### UPDATE / DELETE WHERE
 
@@ -187,9 +199,26 @@ Both are available via `SELECT *` (included in the column set) and via explicit 
 
 > **Reserved names:** Because `ETag` and `Timestamp` are intercepted by the driver and mapped to entity meta fields, you cannot use them as ordinary property names. If your entity has a stored property that happens to be named `ETag` or `Timestamp`, the driver will surface the server-managed meta-field value instead of the stored property value in `SELECT` results. Avoid using these names for your own properties.
 
+### COUNT(*)
+
+`SELECT COUNT(*) FROM <table> [WHERE ...]` returns a single row with a single column `count` holding the number of matching entities.
+
+```sql
+SELECT COUNT(*) FROM People WHERE PartitionKey = ?
+```
+
+**This is an O(n) client-side operation.** Table Storage has no server-side count — the driver enumerates all matching entities by iterating the list pager to completion, incrementing a counter per entity and discarding each page as it is consumed (so memory stays bounded to one page). On large tables this is slow and consumes request units; scope the count with a `WHERE` filter on `PartitionKey` (a point or range scan) whenever possible.
+
+Restrictions:
+
+- Only `COUNT(*)` is supported. `COUNT(col)` is rejected at parse time — Table Storage has no null-tracking, so "non-null count" would mean "entities where the property is present", which is not what most callers expect. Use `COUNT(*)` with a `WHERE` filter instead.
+- `LIMIT` is not accepted on `COUNT(*)` (it is semantically meaningless — a count of the first N rows?).
+- The `WHERE` clause follows the same rules as `SELECT` — all comparison operators are supported, and the read-only pseudo-columns `ETag` / `Timestamp` cannot be used as filter predicates.
+- The returned count follows the [SELECT return values](#select-return-values) typing: `encoding/json` decodes the number as `float64`. Scan into `interface{}` or a numeric type and convert as needed.
+
 ### What's NOT supported
 
-- Joins, subqueries, `ORDER BY`, `LIMIT`, `TOP`, `GROUP BY`
+- Joins, subqueries, `ORDER BY`, `TOP`, `GROUP BY`
 - `OR`, `LIKE`, `IS NULL`, `IN`
 - Bare numeric literals in `WHERE` (use a `?` placeholder or a quoted string literal instead)
 - Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) — use the [Batch API](#batch-entity-group-transactions) for atomic multi-entity writes within a single partition
@@ -218,6 +247,8 @@ err = conn.Raw(func(driverConn any) error {
 `BatchKind` values: `BatchInsert`, `BatchInsertMerge`, `BatchInsertReplace`, `BatchUpdateMerge`, `BatchUpdateReplace`, `BatchDelete`.
 
 Each op may carry an optional `ETag` (the special value `"*"` matches any existing ETag). The driver validates client-side that all ops share one `PartitionKey`, that there are at most 100 ops, and that no `RowKey` is targeted twice within a batch — a single failing op rolls back the entire batch atomically. The total payload size limit (~4 MiB per batch) is enforced by the service; oversized batches are rejected server-side.
+
+**Mixed operation types.** A single batch may freely mix `BatchInsert`, `BatchInsertMerge`, `BatchInsertReplace`, `BatchUpdateMerge`, `BatchUpdateReplace`, and `BatchDelete` ops. The single-partition constraint applies to the *batch as a whole* regardless of the operation mix — every op's `Partition` must match the first op's `Partition`, even when the kinds differ. Likewise the 100-op limit and the no-duplicate-`RowKey` rule count across all kinds in the batch.
 
 ## Table management (DDL)
 

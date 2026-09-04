@@ -20,6 +20,7 @@ const (
 	qCreateTable
 	qDropTable
 	qShowTables
+	qCount
 )
 
 // upsertMode distinguishes the three INSERT-family execution strategies.
@@ -101,6 +102,23 @@ var (
 	// instead of falling through to "unsupported query". Table Storage is
 	// schemaless — column definitions are meaningless.
 	createTableWithColsRe = regexp.MustCompile(`(?is)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[A-Za-z0-9_]+\s*\(`)
+	// countRe matches SELECT COUNT(*) FROM <table> [WHERE ...] [LIMIT n].
+	// COUNT(*) is the only supported aggregate — Table Storage has no
+	// server-side count, so COUNT(*) is implemented by enumerating matching
+	// entities client-side. A LIMIT group is captured (group 3) so that a
+	// trailing LIMIT is rejected with a clear "COUNT(*) does not support
+	// LIMIT" message rather than being swallowed into the lazy WHERE capture
+	// (group 2) and surfacing as a generic "unsupported WHERE condition"
+	// error. The LIMIT-in-literal edge case (e.g. WHERE Note = 'LIMIT 10')
+	// is handled by the $ anchor forcing backtracking, mirroring selectRe's
+	// proven structure.
+	countRe = regexp.MustCompile(`(?is)^SELECT\s+COUNT\s*\(\s*\*\s*\)\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*(?:LIMIT\s+(\d+))?\s*;?\s*$`)
+	// countExprRe detects a COUNT(...) expression in the SELECT column list
+	// so that statements which didn't match countRe (e.g. COUNT(col), or
+	// COUNT(*) AS alias, or COUNT(*), Name) are rejected with a clear
+	// message instead of being treated as a column literally named
+	// "COUNT(*)" or "COUNT(col)".
+	countExprRe = regexp.MustCompile(`(?i)^COUNT\s*\(`)
 )
 
 func parseQuery(query string) (*parsedQuery, error) {
@@ -162,8 +180,36 @@ func parseQuery(query string) (*parsedQuery, error) {
 		return &parsedQuery{kind: qDelete, table: table, where: conds, numPlaceholders: n}, nil
 	}
 
+	if m := countRe.FindStringSubmatch(q); m != nil {
+		// m[3] is the optional LIMIT <n> capture. LIMIT is not meaningful on
+		// a count (a count of the first N rows?) — reject with a clear
+		// message. This check runs before parseWhere so the LIMIT token is
+		// not swallowed into the WHERE capture and misreported as a generic
+		// WHERE parse error.
+		if m[3] != "" {
+			return nil, errors.New("aztablessql: COUNT(*) does not support LIMIT")
+		}
+		table := m[1]
+		conds, n, err := parseWhere(m[2])
+		if err != nil {
+			return nil, err
+		}
+		if err := validateSelectWhere(conds); err != nil {
+			return nil, err
+		}
+		return &parsedQuery{kind: qCount, table: table, where: conds, numPlaceholders: n}, nil
+	}
+
 	if m := selectRe.FindStringSubmatch(q); m != nil {
 		colsStr := strings.TrimSpace(m[1])
+		// A COUNT(...) expression that didn't match countRe reaches here —
+		// e.g. COUNT(col), COUNT(*) AS alias, or COUNT(*), Name. (COUNT(*)
+		// with a trailing LIMIT is caught by countRe's LIMIT group, not
+		// here.) Reject with a clear message rather than treating "COUNT(*)"
+		// / "COUNT(col)" as a column name.
+		if countExprRe.MatchString(colsStr) {
+			return nil, errors.New("aztablessql: only COUNT(*) is supported as the sole SELECT expression — COUNT(col), aliases (AS), and mixed COUNT/column lists are not supported (use COUNT(*) with a WHERE filter instead)")
+		}
 		table := m[2]
 		conds, n, err := parseWhere(m[3])
 		if err != nil {
