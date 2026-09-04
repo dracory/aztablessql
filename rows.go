@@ -16,6 +16,7 @@ import (
 type Rows struct {
 	columns []string // explicit selected columns (nil if allCols)
 	allCols bool
+	limit   int // SELECT LIMIT <n>; 0 = no limit. Enforced client-side as a backstop to server-side $top.
 
 	// Lazy paging state. Only the list path uses pager/page/pagePos.
 	// Point reads populate entities directly and leave pager nil.
@@ -27,6 +28,7 @@ type Rows struct {
 	entities     [][]byte
 	pos          int
 	resolvedCols []string
+	returned     int // number of rows already returned via Next (for LIMIT cap)
 
 	ctx    context.Context // captured for NextPage calls
 	err    error           // sticky error surfaced via Next/Err
@@ -107,18 +109,37 @@ func (r *Rows) Close() error {
 
 // Next populates dest with the next row. Returns io.EOF when there are no
 // more rows. For the list path, pages are fetched lazily as needed.
+//
+// A prior sticky error (from a failed NextPage) is surfaced before the
+// LIMIT cap so that the caller always sees real errors, not a misleading
+// io.EOF that happens to coincide with the limit boundary.
+//
+// When a LIMIT was set on the SELECT, iteration stops once `limit` rows have
+// been returned — even if more pages are available. This is a client-side
+// backstop to the server-side $top cap (the server may return up to `limit`
+// entities, so normally this never triggers, but it guards against any
+// server/SDK edge cases and avoids fetching further pages).
 func (r *Rows) Next(dest []driver.Value) error {
 	if r.closed {
 		return io.EOF
 	}
 
+	// Surface a prior sticky error before anything else — including the
+	// LIMIT cap. If a NextPage call failed on the previous invocation, the
+	// caller must see that error rather than a misleading io.EOF that
+	// happens to coincide with the limit boundary.
+	if r.err != nil {
+		return r.err
+	}
+
+	// Client-side LIMIT cap. Checked before pulling the next entity so we
+	// don't fetch another page just to discard it.
+	if r.limit > 0 && r.returned >= r.limit {
+		return io.EOF
+	}
+
 	// Lazy paging path.
 	if r.pager != nil {
-		// Short-circuit on a prior sticky error so we don't retry the
-		// failed NextPage call.
-		if r.err != nil {
-			return r.err
-		}
 		for r.pagePos >= len(r.page) {
 			// Current page exhausted; try to fetch the next one.
 			if !r.pager.More() {
@@ -138,7 +159,11 @@ func (r *Rows) Next(dest []driver.Value) error {
 		}
 		entity := r.page[r.pagePos]
 		r.pagePos++
-		return r.decodeEntity(entity, dest)
+		if err := r.decodeEntity(entity, dest); err != nil {
+			return err
+		}
+		r.returned++
+		return nil
 	}
 
 	// Point-read path.
@@ -150,7 +175,11 @@ func (r *Rows) Next(dest []driver.Value) error {
 	}
 	entity := r.entities[r.pos]
 	r.pos++
-	return r.decodeEntity(entity, dest)
+	if err := r.decodeEntity(entity, dest); err != nil {
+		return err
+	}
+	r.returned++
+	return nil
 }
 
 func (r *Rows) decodeEntity(entity []byte, dest []driver.Value) error {

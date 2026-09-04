@@ -2,7 +2,9 @@ package aztablessql
 
 import (
 	"fmt"
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -48,6 +50,7 @@ type parsedQuery struct {
 	allColumns        bool     // SELECT *
 	set               []setAssign
 	where             []whereCond
+	limit             int // SELECT only: LIMIT <n> (0 = no limit); ≥1 when set
 	numPlaceholders   int // total, in argument order: SET placeholders then WHERE placeholders
 	setPlaceholders   int
 	wherePlaceholders int
@@ -61,7 +64,11 @@ var (
 	// which defaults to replace semantics). Groups 2/3/4 are table/cols/vals.
 	upsertRe = regexp.MustCompile(`(?is)^(?:INSERT\s+OR\s+(REPLACE|MERGE)|UPSERT)\s+INTO\s+([A-Za-z0-9_]+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)\s*;?\s*$`)
 	deleteRe = regexp.MustCompile(`(?is)^DELETE\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*;?\s*$`)
-	selectRe = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*;?\s*$`)
+	// selectRe captures an optional trailing `LIMIT <n>` (digits only — no
+	// placeholder, see IMPLEMENTATION_PLAN item 4). The LIMIT group is
+	// validated/rejected after the match (LIMIT 0 is rejected). LIMIT is
+	// only accepted on SELECT because only selectRe includes the group.
+	selectRe = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+([A-Za-z0-9_]+)\s*(?:WHERE\s+(.+?))?\s*(?:LIMIT\s+(\d+))?\s*;?\s*$`)
 	// updatePrefixRe matches the "UPDATE <table> SET " prefix. The SET and
 	// WHERE clauses are split manually by findUpdateSplit, which is
 	// quote-aware and handles quoted literals containing the word WHERE.
@@ -130,6 +137,26 @@ func parseQuery(query string) (*parsedQuery, error) {
 			pq.allColumns = true
 		} else {
 			pq.columns = splitAndTrim(colsStr, ",")
+		}
+		// m[4] is the optional LIMIT <n> capture (digits only). LIMIT 0 is
+		// rejected as ambiguous (no-limit vs. zero rows). A placeholder
+		// (`LIMIT ?`) does not match \d+ so the whole statement is rejected
+		// by the regex — see TestParseSelectLimitRejectsPlaceholder.
+		// Values exceeding math.MaxInt32 are rejected because the server-
+		// side $top parameter is an int32; a silent wrap-around would ask
+		// the server for the wrong (possibly negative) count.
+		if m[4] != "" {
+			limit, err := strconv.Atoi(m[4])
+			if err != nil {
+				return nil, fmt.Errorf("aztablessql: invalid LIMIT value %q", m[4])
+			}
+			if limit < 1 {
+				return nil, fmt.Errorf("aztablessql: LIMIT must be ≥ 1, got %d", limit)
+			}
+			if limit > math.MaxInt32 {
+				return nil, fmt.Errorf("aztablessql: LIMIT must be ≤ %d, got %d", math.MaxInt32, limit)
+			}
+			pq.limit = limit
 		}
 		return pq, nil
 	}

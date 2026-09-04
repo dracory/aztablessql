@@ -241,11 +241,11 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 		resp, err := client.GetEntity(ctx, pk, rk, nil)
 		if err != nil {
 			if isNotFound(err) {
-				return &Rows{columns: s.pq.columns, allCols: s.pq.allColumns}, nil
+				return &Rows{columns: s.pq.columns, allCols: s.pq.allColumns, limit: s.pq.limit}, nil
 			}
 			return nil, err
 		}
-		return &Rows{columns: s.pq.columns, allCols: s.pq.allColumns, entities: [][]byte{resp.Value}}, nil
+		return &Rows{columns: s.pq.columns, allCols: s.pq.allColumns, limit: s.pq.limit, entities: [][]byte{resp.Value}}, nil
 	}
 
 	// List path: fetch page 1 eagerly so Columns() can be answered before
@@ -256,6 +256,24 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 	if filter := buildODataFilter(conds); filter != "" {
 		opts.Filter = &filter
 	}
+	// Server-side $top cap. When LIMIT is set, ask the server to return at
+	// most that many entities — it short-circuits the query and avoids
+	// fetching pages we'll discard. The Rows iterator also enforces the
+	// cap client-side as a defensive backstop.
+	if s.pq.limit > 0 {
+		top := int32(s.pq.limit)
+		opts.Top = &top
+	}
+	// Server-side $select projection pushdown. When the caller asked for an
+	// explicit column list containing only real properties (no ETag /
+	// Timestamp pseudo-columns), ask the server to return just those
+	// properties. This reduces bandwidth for entities with many properties.
+	// Pseudo-columns are not selectable server-side, so when present we
+	// fall back to a full fetch and project client-side in Rows.Next.
+	if !s.pq.allColumns && serverSelectable(s.pq.columns) {
+		sel := strings.Join(s.pq.columns, ",")
+		opts.Select = &sel
+	}
 	pager := client.NewListEntitiesPager(opts)
 	resp, err := pager.NextPage(ctx)
 	if err != nil {
@@ -264,6 +282,7 @@ func (s *Stmt) execSelect(ctx context.Context, args []driver.Value) (driver.Rows
 	return &Rows{
 		columns: s.pq.columns,
 		allCols: s.pq.allColumns,
+		limit:   s.pq.limit,
 		pager:   pager,
 		page:    resp.Entities,
 		pagePos: 0,
@@ -420,6 +439,26 @@ func wrapPreconditionFailed(err error) error {
 // ---------------------------------------------------------------------------
 // OData filter builder — type-aware
 // ---------------------------------------------------------------------------
+
+// serverSelectable reports whether an explicit SELECT column list contains
+// only real, server-stored properties — i.e. no read-only pseudo-columns
+// (ETag, Timestamp). When true, the list can be pushed down to the server
+// via ListEntitiesOptions.Select ($select) so the server drops unselected
+// properties and reduces wire payload.
+//
+// Pseudo-columns are surfaced from entity meta fields (odata.etag, the
+// server-managed Timestamp) and are not selectable server-side; passing them
+// to $select would be rejected by the Table Storage service. When this
+// returns false, the caller falls back to a full fetch and projects
+// client-side in Rows.Next.
+func serverSelectable(cols []string) bool {
+	for _, c := range cols {
+		if strings.EqualFold(c, "ETag") || strings.EqualFold(c, "Timestamp") {
+			return false
+		}
+	}
+	return true
+}
 
 func buildODataFilter(conds []resolvedCond) string {
 	var parts []string

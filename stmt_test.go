@@ -534,3 +534,36 @@ func TestValidatePointConds(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// $select projection pushdown (Tier 2, item 5)
+// ---------------------------------------------------------------------------
+
+func TestServerSelectable(t *testing.T) {
+	cases := []struct {
+		name string
+		cols []string
+		want bool
+	}{
+		{"empty list", []string{}, true},
+		{"single real property", []string{"Name"}, true},
+		{"multiple real properties", []string{"Name", "Age", "Score"}, true},
+		{"partition key only", []string{"PartitionKey"}, true},
+		{"row key only", []string{"RowKey"}, true},
+		{"keys plus property", []string{"PartitionKey", "RowKey", "Name"}, true},
+		{"etag blocks pushdown", []string{"ETag"}, false},
+		{"timestamp blocks pushdown", []string{"Timestamp"}, false},
+		{"lowercase etag blocks pushdown", []string{"etag"}, false},
+		{"lowercase timestamp blocks pushdown", []string{"timestamp"}, false},
+		{"mixed etag and real blocks pushdown", []string{"ETag", "Name"}, false},
+		{"mixed timestamp and real blocks pushdown", []string{"Name", "Timestamp"}, false},
+		{"etag anywhere blocks pushdown", []string{"Name", "Age", "ETag", "Score"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := serverSelectable(c.cols); got != c.want {
+				t.Errorf("serverSelectable(%v) = %v, want %v", c.cols, got, c.want)
+			}
+		})
+	}
+}
