@@ -4,6 +4,17 @@ A `database/sql` driver for [Azure Table Storage](https://learn.microsoft.com/en
 
 It lets you use the standard `database/sql` API (`db.Exec`, `db.Query`, prepared statements) against Azure Table Storage, translating a small subset of SQL into Table Storage REST operations.
 
+## Why it's needed?
+
+Azure Table Storage is a cheap, schemaless NoSQL store, but its SDK is REST/OData-flavored and has no SQL surface. That creates friction in a few common situations:
+
+- **Tooling that speaks `database/sql`** — ORMs, query builders, migration helpers, and SQL-based libraries expect a `database/sql` driver. Without one, Table Storage is invisible to that ecosystem.
+- **Codebases migrating off SQL databases** — when moving from SQLite/Postgres to Table Storage, rewriting every data-access call to the `aztables` SDK is invasive and error-prone. A SQL dialect lets you keep most query code intact.
+- **Quick scripts and one-off tooling** — `db.Query("SELECT * FROM People WHERE ...")` is faster to write than constructing OData filter strings by hand.
+- **Familiarity** — teams already fluent in SQL can read and review data-access code without learning the OData filter grammar (`PartitionKey eq 'pk' and RowKey eq 'rk'`, URL-encoding, etc.).
+
+This driver is intentionally a **small subset** of SQL — point reads, simple `AND` filters, and single-entity mutations — mapped onto the operations Table Storage actually supports. It is not a full SQL engine, and the [Supported SQL](#supported-sql) and [What's NOT supported](#whats-not-supported) sections make those limits explicit so you can decide whether it fits your use case.
+
 ## Install
 
 ```bash
